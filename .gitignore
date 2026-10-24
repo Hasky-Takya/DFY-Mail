@@ -1,0 +1,10 @@
+/config/my_settings.json
+
+/log/mail_log/*
+
+/memory/*
+
+/.venv/
+
+deepseek-json-prompt-deepseek-deepseek-toasty-shannon.md
+
