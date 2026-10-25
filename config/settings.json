@@ -1,7 +1,7 @@
 {
   "check_interval_minutes": 1,
   "assistant": {
-    "email": "haskytakya@126.com",
+    "email": "",
     "auth_code_env": "MAIL_AUTH_CODE",
     "imap_host": "imap.126.com",
     "imap_port": 993,
@@ -9,6 +9,6 @@
     "smtp_port": 465
   },
   "user": {
-    "email": "hasky_takya@163.com"
+    "email": ""
   }
 }
