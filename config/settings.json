@@ -1,14 +1,14 @@
 {
   "check_interval_minutes": 1,
   "assistant": {
-    "email": "EMAIL_ADDRESS_FOR_DEEPSEEK",
+    "email": "haskytakya@126.com",
     "auth_code_env": "MAIL_AUTH_CODE",
-    "imap_host": "",
+    "imap_host": "imap.126.com",
     "imap_port": 993,
-    "smtp_host": "",
+    "smtp_host": "smtp.126.com",
     "smtp_port": 465
   },
   "user": {
-    "email": "EMAIL_ADDRESS_FOR_USER"
+    "email": "hasky_takya@163.com"
   }
 }

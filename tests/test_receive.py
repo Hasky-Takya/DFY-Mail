@@ -494,7 +494,7 @@ class ReceiverTests(unittest.TestCase):
 
     def test_missing_prompt_rejected_and_default_path(self):
         self.assertEqual(receive.PROMPT_PATH, SRC.parent / "config" / "prompt.json")
-        with patch("pathlib.Path.open", unittest.mock.mock_open(read_data='{"prompt": "old greeting"}')):
+        with patch("pathlib.Path.open", unittest.mock.mock_open(read_data='{"reply_task": ["回答来信"]}')):
             with self.assertRaises(ValueError):
                 receive.load_reply_prompt()
 

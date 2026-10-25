@@ -17,7 +17,7 @@ from openai import APIConnectionError, APIStatusError, OpenAIError
 from dfy_test import DeepSeekChat
 from dialog_memory import (
     DialogMemory, MEMORY_PATH, MemoryError, load_summary_prompt, new_record,
-    now_iso, send_recorded, summarize,
+    now_iso, render_email_prompt, send_recorded, summarize,
 )
 from mail import MailboxStateError, MailClient, _load_settings
 from mail_logging import configure_logging, set_log_secrets
@@ -43,10 +43,12 @@ def interval_seconds(settings: dict) -> float:
 def load_reply_prompt(prompt_path: str | Path = PROMPT_PATH) -> str:
     with Path(prompt_path).open(encoding="utf-8-sig") as file:
         settings = json.load(file)
-    prompt = settings.get("reply_prompt") if isinstance(settings, dict) else None
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ValueError("请在 config/prompt.json 中填写非空的 reply_prompt。")
-    return prompt.strip()
+    if not isinstance(settings, dict):
+        raise ValueError("prompt.json 必须是 JSON 对象。")
+    try:
+        return render_email_prompt(settings, "reply_task").strip()
+    except ValueError as exc:
+        raise ValueError(f"config/prompt.json 中的 prompt 或 reply_task 无效：{exc}") from None
 
 
 def reply_subject(subject: str) -> str:

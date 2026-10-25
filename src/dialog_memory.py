@@ -227,6 +227,35 @@ class DialogMemory:
         return result
 
 
+def render_prompt(value) -> str:
+    """兼容旧字符串，以及按标签分组、用字符串数组表示各行的提示词。"""
+    if isinstance(value, str) and value.strip():
+        return value
+    if not isinstance(value, dict) or not value:
+        raise ValueError("提示词必须是非空字符串或按标签分组的对象。")
+    sections = []
+    for label, lines in value.items():
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("提示词标签不能为空。")
+        if (
+            not isinstance(lines, list) or not lines
+            or any(not isinstance(line, str) for line in lines)
+            or not any(line.strip() for line in lines)
+        ):
+            raise ValueError(f"提示词标签 {label} 的内容必须是非空字符串数组。")
+        sections.append(f"【{label}】\n" + "\n".join(lines))
+    return "\n\n".join(sections)
+
+
+def render_email_prompt(settings: dict, task_key: str) -> str:
+    """共用一份人设，再追加当前发信或回信任务。"""
+    prompt = render_prompt(settings.get("prompt"))
+    if task_key in settings:
+        task = render_prompt({"邮件任务与输出要求": settings[task_key]})
+        prompt += "\n\n" + task
+    return prompt
+
+
 def load_summary_prompt(path: str | Path = PROMPT_PATH) -> str:
     with Path(path).open(encoding="utf-8-sig") as file:
         data = json.load(file)

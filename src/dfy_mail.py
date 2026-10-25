@@ -11,7 +11,7 @@ from openai import OpenAIError
 from dfy_test import DeepSeekChat
 from dialog_memory import (
     DialogMemory, MEMORY_PATH, MemoryError, SummaryError, load_summary_prompt,
-    new_record, send_recorded, summarize,
+    new_record, render_email_prompt, send_recorded, summarize,
 )
 from mail import MailClient, _load_settings
 
@@ -24,9 +24,12 @@ def load_prompt(prompt_path: str | Path = PROMPT_PATH) -> dict:
         prompt = json.load(file)
     if not isinstance(prompt, dict):
         raise ValueError("prompt.json 必须是 JSON 对象。")
-    for key in ("subject", "prompt"):
-        if not isinstance(prompt.get(key), str) or not prompt[key].strip():
-            raise ValueError(f"请在 prompt.json 中填写非空字符串：{key}")
+    if not isinstance(prompt.get("subject"), str) or not prompt["subject"].strip():
+        raise ValueError("请在 prompt.json 中填写非空字符串：subject")
+    try:
+        prompt["prompt"] = render_email_prompt(prompt, "send_task")
+    except ValueError as exc:
+        raise ValueError(f"prompt.json 中的 prompt 无效：{exc}") from None
     if "\r" in prompt["subject"] or "\n" in prompt["subject"]:
         raise ValueError("邮件主题不能包含换行。")
     return prompt

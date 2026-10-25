@@ -1,0 +1,14 @@
+{
+  "check_interval_minutes": 1,
+  "assistant": {
+    "email": "EMAIL_ADDRESS_FOR_DEEPSEEK",
+    "auth_code_env": "MAIL_AUTH_CODE",
+    "imap_host": "",
+    "imap_port": 993,
+    "smtp_host": "",
+    "smtp_port": 465
+  },
+  "user": {
+    "email": "EMAIL_ADDRESS_FOR_USER"
+  }
+}
