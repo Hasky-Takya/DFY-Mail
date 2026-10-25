@@ -1,5 +1,12 @@
 /config/my_settings.json
 
+# Python 运行缓存
+__pycache__/
+*.py[cod]
+
+# 各机器自己的实际配置
+/config/settings.json
+
 /log/mail_log/*
 /log/output_log/
 
