@@ -1,6 +1,7 @@
 /config/my_settings.json
 
 /log/mail_log/*
+/log/output_log/
 
 /memory/*
 

@@ -315,6 +315,10 @@ class IntegrationTests(unittest.TestCase):
         with patch.object(proactive, "MailClient", return_value=self.box), patch.object(proactive, "DeepSeekChat", return_value=self.bot):
             result = proactive.send_deepseek_email("fake-key", "fake-auth", config, memory_path=self.path)
         self.assertIn("之前谈到运动。", self.bot.ask.call_args_list[0].args[0])
+        request = self.bot.ask.call_args_list[0].args[0]
+        payload = json.loads(request[request.index("{"):])
+        self.assertEqual(payload["conversation_state"]["mode"], "manual_proactive")
+        self.assertEqual(payload["conversation_state"]["after_latest_assistant"]["contact"], "unknown")
         saved = self.store.snapshot()["dialogs"][-1]
         self.assertEqual(saved["type"], "deepseek自己主动发送")
         self.assertIsNone(saved["received_at"])

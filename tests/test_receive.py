@@ -23,6 +23,8 @@ def load_module(name, filename):
     return module
 
 
+mail_logging = load_module("tested_mail_logging", "mail_logging.py")
+sys.modules["mail_logging"] = mail_logging
 mail = load_module("tested_mail", "mail.py")
 # 模拟整个 SDK，即使尚未安装依赖也能运行。
 sdk = ModuleType("openai")
@@ -47,7 +49,8 @@ sdk.APIStatusError = APIStatusError
 sdk.OpenAI = MagicMock()
 with patch.dict(sys.modules, {"openai": sdk}):
     llm = load_module("tested_llm", "dfy_test.py")
-mail_logging = load_module("tested_mail_logging", "mail_logging.py")
+story_module = load_module("tested_story_memory", "story_memory.py")
+sys.modules["story_memory"] = story_module
 memory_module = load_module("tested_dialog_memory", "dialog_memory.py")
 with patch.dict(sys.modules, {"openai": sdk, "dfy_test": llm, "mail": mail, "mail_logging": mail_logging, "dialog_memory": memory_module}):
     receive = load_module("tested_receive", "dfy_receive.py")
@@ -511,7 +514,8 @@ class ReceiverTests(unittest.TestCase):
             self.listener.poll_once()
         self.assertEqual(self.listener.cursor, (10, 0))
         self.box.send_email.assert_not_called()
-        self.assertTrue(any("fake disconnect" in line for line in output.output))
+        self.assertTrue(any("abort" in line for line in output.output))
+        self.assertTrue(all("fake disconnect" not in record.getMessage() for record in output.records))
 
     def test_recovers_next_poll_without_resetting_baseline(self):
         self.box.describe_error.side_effect = lambda exc: str(exc)

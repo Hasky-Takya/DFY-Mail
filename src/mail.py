@@ -8,6 +8,7 @@ import os
 import re
 import smtplib
 import ssl
+import sys
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from email import policy
@@ -17,6 +18,8 @@ from email.utils import formatdate, make_msgid, parsedate_to_datetime
 from getpass import getpass
 from html.parser import HTMLParser
 from pathlib import Path
+
+from mail_logging import close_logging, set_log_secrets, start_logging
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "config" / "settings.json"
@@ -395,6 +398,65 @@ class MailClient:
         with self._imap() as connection:
             return self._cursor_from_connection(connection)
 
+    def latest_user_activity(self, cursor: tuple[int, int]) -> dict | None:
+        """只读查询基线内最近有效用户来信，仅取过滤所需邮件头和 INTERNALDATE。
+
+        按 UID 而非邮件 Date 排序；时间缺失仍返回该信，不回退到更旧邮件。
+        """
+        if (
+            not isinstance(cursor, tuple) or len(cursor) != 2
+            or type(cursor[0]) is not int or cursor[0] <= 0
+            or type(cursor[1]) is not int or cursor[1] < 0
+        ):
+            raise ValueError("cursor 必须是 (正整数 UIDVALIDITY, 非负整数最大 UID)。")
+        expected_validity, baseline = cursor
+        with self._imap() as connection:
+            kind, data = self._imap_command(
+                "查询活动邮箱 UIDVALIDITY", connection.response, "UIDVALIDITY"
+            )
+            if (
+                kind != "UIDVALIDITY" or not data or len(data) != 1
+                or not isinstance(data[0], bytes) or not data[0].isdigit()
+                or int(data[0]) != expected_validity
+            ):
+                raise MailboxStateError("邮箱 UIDVALIDITY 缺失或已改变，不能安全查询用户活动。")
+            if baseline == 0:
+                return None  # IMAP 的 1:0 不是空范围，不能发送该搜索。
+            status, data = self._imap_command(
+                "UID SEARCH 查询基线内用户活动", connection.uid,
+                "search", None, "UID", f"1:{baseline}", "FROM", f'"{self.user_email}"',
+            )
+            if status != "OK":
+                raise imaplib.IMAP4.error("搜索用户活动失败。")
+            if not data or not isinstance(data[0], bytes):
+                raise MailboxStateError("邮箱返回了无效的用户活动 UID 搜索结果。")
+            uids = sorted({
+                int(uid) for uid in data[0].split()
+                if uid.isdigit() and 1 <= int(uid) <= baseline
+            }, reverse=True)
+            for number in uids:
+                uid = str(number).encode()
+                status, parts = self._imap_command(
+                    "UID FETCH 读取用户活动邮件头", connection.uid, "fetch", uid,
+                    "(INTERNALDATE BODY.PEEK[HEADER.FIELDS "
+                    "(FROM AUTO-SUBMITTED PRECEDENCE RETURN-PATH LIST-ID CONTENT-TYPE)])",
+                )
+                if status != "OK":
+                    raise imaplib.IMAP4.error("读取用户活动邮件头失败。")
+                raw, received_at = _fetch_email_data(parts)
+                if raw is None:
+                    continue  # 邮件可能在搜索后被移走或删除。
+                message = BytesParser(policy=policy.default).parsebytes(raw, headersonly=True)
+                if self._email_filter_reason(message, automatic=True) is not None:
+                    continue
+                return {
+                    "uid": str(number),
+                    "uidvalidity": str(expected_validity),
+                    "received_at": received_at,
+                    "received_at_source": "imap_internaldate" if received_at is not None else "unknown",
+                }
+        return None
+
     def read_user_emails_since(
         self, cursor: tuple[int, int]
     ) -> tuple[tuple[int, int], list[dict]]:
@@ -505,46 +567,80 @@ class MailClient:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="126 邮箱收发接口；默认只检查连接。")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="配置文件路径")
-    commands = parser.add_subparsers(dest="command")
-    commands.add_parser("check", help="检查收发连接，不发信")
-    diagnose = commands.add_parser("diagnose", help="只读诊断指定 UID 为什么被过滤，不读正文、不发信")
-    diagnose.add_argument("--uid", type=int, required=True)
-    read = commands.add_parser("read", help="读取最近的用户来信，包含已读邮件")
-    read.add_argument("--limit", type=int, default=10)
-    send = commands.add_parser("send", help="向配置用户发送邮件")
-    send.add_argument("--subject", required=True)
-    send.add_argument("--body", required=True)
-    args = parser.parse_args()
-
+    start_logging("mail.py")
+    exit_code = 0
     try:
+        logger.info("邮箱程序启动。")
+        parser = argparse.ArgumentParser(description="126 邮箱收发接口；默认只检查连接。")
+        parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="配置文件路径")
+        commands = parser.add_subparsers(dest="command")
+        commands.add_parser("check", help="检查收发连接，不发信")
+        diagnose = commands.add_parser("diagnose", help="只读诊断指定 UID 为什么被过滤，不读正文、不发信")
+        diagnose.add_argument("--uid", type=int, required=True)
+        read = commands.add_parser("read", help="读取最近的用户来信，包含已读邮件")
+        read.add_argument("--limit", type=int, default=10)
+        send = commands.add_parser("send", help="向配置用户发送邮件")
+        send.add_argument("--subject", required=True)
+        send.add_argument("--body", required=True)
+        args = parser.parse_args()
+
         settings = _load_settings(args.config)
-        auth_code = os.getenv(settings["assistant"]["auth_code_env"]) or getpass(
-            "请输入助手邮箱客户端授权码（不显示）："
-        )
+        auth_code = os.getenv(settings["assistant"]["auth_code_env"])
+        if auth_code:
+            set_log_secrets(auth_code)
+        else:
+            auth_code = getpass("请输入助手邮箱客户端授权码（不显示）：")
+            set_log_secrets(auth_code)
         client = MailClient(args.config, auth_code=auth_code)
         if args.command == "diagnose":
             print(json.dumps(client.diagnose_email(args.uid), ensure_ascii=False, indent=2))
+            logger.info("邮件诊断完成，数量=1。")
         elif args.command == "read":
             messages = client.read_user_emails(args.limit)
             print(json.dumps(messages, ensure_ascii=False, indent=2))
+            logger.info("邮件读取完成，数量=%s。", len(messages))
         elif args.command == "send":
-            message_id = client.send_email(args.subject, args.body)
-            print(f"SMTP 已接受邮件（不保证最终投递），Message-ID：{message_id}")
+            client.send_email(args.subject, args.body)
+            logger.info("SMTP 已接受邮件（不保证最终投递），数量=1。")
         else:
             client.check_connection()
-            print("IMAP 和 SMTP 连接检查通过，未发送邮件。")
+            logger.info("IMAP 和 SMTP 连接检查通过，未发送邮件。")
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else 1
+        if exit_code == 0:
+            logger.info("命令行帮助显示完成，退出码=%s。", exit_code)
+        else:
+            logger.error("命令行解析退出，退出码=%s。", exit_code)
+        raise SystemExit(exit_code) from None
     except ValueError as exc:
-        parser.exit(1, f"配置或输入错误：{exc}\n")
-    except smtplib.SMTPAuthenticationError:
-        parser.exit(1, "SMTP 登录失败，请检查助手邮箱、授权码及 SMTP 服务开关。\n")
-    except imaplib.IMAP4.error:
-        parser.exit(1, "IMAP 操作失败，请检查授权码、IMAP 服务及客户端访问限制。\n")
+        exit_code = 1
+        logger.error("配置或输入错误，类型=%s。", type(exc).__name__, exc_info=True)
+        parser.exit(exit_code, "配置或输入错误，请检查配置字段及命令参数。\n")
+    except smtplib.SMTPAuthenticationError as exc:
+        exit_code = 1
+        logger.error("SMTP 登录失败，类型=%s。", type(exc).__name__, exc_info=True)
+        parser.exit(exit_code, "SMTP 登录失败，请检查助手邮箱、授权码及 SMTP 服务开关。\n")
+    except imaplib.IMAP4.error as exc:
+        exit_code = 1
+        logger.error("IMAP 操作失败，类型=%s。", type(exc).__name__, exc_info=True)
+        parser.exit(exit_code, "IMAP 操作失败，请检查授权码、IMAP 服务及客户端访问限制。\n")
     except (smtplib.SMTPException, OSError) as exc:
-        parser.exit(1, f"邮箱操作失败（{type(exc).__name__}），请检查配置或网络；发送失败时勿盲目重试。\n")
-    except (KeyboardInterrupt, EOFError):
+        exit_code = 1
+        logger.error("邮箱操作失败，请勿盲目重试发送，类型=%s。", type(exc).__name__, exc_info=True)
+        parser.exit(exit_code, f"邮箱操作失败（{type(exc).__name__}），请检查配置或网络；发送失败时勿盲目重试。\n")
+    except (KeyboardInterrupt, EOFError) as exc:
+        logger.info("用户结束终端交互，类型=%s。", type(exc).__name__, exc_info=True)
         print("\n已退出。")
+    except Exception as exc:
+        exit_code = 1
+        logger.critical("邮箱程序发生未预期错误，类型=%s。", type(exc).__name__, exc_info=True)
+        print("邮箱程序发生未预期错误，已停止；发送失败时勿盲目重试。", file=sys.stderr)
+        raise SystemExit(exit_code) from None
+    finally:
+        try:
+            logger.info("邮箱程序结束，退出码=%s。", exit_code)
+        finally:
+            close_logging()
 
 
 if __name__ == "__main__":

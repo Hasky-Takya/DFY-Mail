@@ -1,4 +1,6 @@
 {
+  "idle_min_minutes": 60,
+  "idle_max_minutes": 240,
   "check_interval_minutes": 1,
   "assistant": {
     "email": "EMAIL_ADDRESS_FOR_DEEPSEEK",
