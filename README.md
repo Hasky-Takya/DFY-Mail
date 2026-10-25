@@ -65,7 +65,8 @@
    ├─ test_conversation_state.py
    ├─ test_memory_observation.py
    ├─ test_story_memory.py
-   └─ test_story_integration.py
+   ├─ test_story_integration.py
+   └─ test_extraction_repair.py
 ```
 
 ## 1. 准备环境
@@ -307,6 +308,10 @@ python src/mail.py --config config/settings.json read --limit 5
 LLM 根据本轮用户和助手原文以及已有条目判断新增或更新，更新原ID并保留版本和来源轨迹，不每轮重复添加。共同角色故事可持续发展，但shared_story不等于用户现实经历；助手说过的话只证明助手表达过，不自动成为用户事实。时间流逝不自动结束事件。
 
 通常仍是**两次模型请求**：正文生成一次，梗概与事件／长期记忆联合提取一次。旧两字段摘要API仍兼容；配置中的 `story_extraction_prompt` 启用四字段模式。当前邮件、历史、对话状态及两个记忆库完整提供，超预算停止，不静默删历史。模型的语义判断仍可能出错。
+
+联合提取请求还包含程序生成的 `json_templates`：根输出模板、事件条目模板、长期记忆条目模板。模型仅填写需要的内容，不回传模板说明；没有新信息时保留空数组，仍由本地严格校验。
+
+校验失败日志额外记录受控 `code` 与 `field`，不记录原文。例如 `code=evidence_not_in_source field=event_updates[0].evidence` 表示证据没有逐字出自所选来源邮件。后续重试会把安全错误、脱敏的上次输出和原任务交给模型，要求针对字段修正并重新返回完整JSON；仍复用正文、最多三次，不在提取函数内再套重试。反馈仅在内存和API请求中使用，不写日志或记忆。坏本地故事上下文属于需核验的运行错误，不再误当模型输出错误重试。更新已有长期记忆时必须保留初始 `origin`。
 
 只提取新版本之后成功确认的邮件往来，不批量回填旧梗概；没有值得记住的内容可返回空更新。未发送或被取消的草稿不进入正式事件。用户信息也随该轮成功对话提交；生成或发送失败不会另建入站事件。
 

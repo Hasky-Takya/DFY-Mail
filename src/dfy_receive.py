@@ -17,7 +17,7 @@ from openai import APIConnectionError, APIStatusError, OpenAIError
 
 from dfy_test import DeepSeekChat
 from dialog_memory import (
-    DialogMemory, MEMORY_PATH, MemoryError, load_story_extraction_prompt, load_summary_prompt, new_record,
+    DialogMemory, MEMORY_PATH, MemoryError, SummaryError, load_story_extraction_prompt, load_summary_prompt, new_record,
     now_iso, render_email_prompt, resolve_reply, send_recorded, summarize,
 )
 from mail import MailboxStateError, MailClient, _load_settings
@@ -233,9 +233,14 @@ class MailReceiver:
                                  for item in task["snapshot"]["dialogs"]],
                         anchors={"as_of": now_iso(), "received_at": message["received_at"],
                                  "received_at_source": message["received_at_source"]},
+                        validation_feedback=task.get("validation_feedback"),
                     )
                 body = task["body"]
             except (OpenAIError, ValueError) as exc:
+                if isinstance(exc, SummaryError):
+                    task["validation_feedback"] = exc.repair_feedback()
+                    logger.warning("联合提取校验失败，UID=%s code=%s field=%s。",
+                                   message["uid"], exc.details["code"], exc.details["path"])
                 task["attempts"] += 1
                 logger.warning(
                     "DeepSeek 请求异常，UID=%s type=%s status=%s attempt=%s duration=%.2fs",

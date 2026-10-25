@@ -141,7 +141,8 @@
     ],
     "长期记忆更新格式": [
       "memory_updates 每项严格包含 target_id、content、source、domain、importance、people、status、category、origin、evidence，可选 related_event_ids 为已知事件id数组。",
-      "只选最值得长期记住的偏好、关系、约定、重要经历或故事设定，忽略重复寒暄和短暂琐事。category 是简短类别；origin 简述记忆由来；importance 为1至5整数。",
+      "只选最值得长期记住的偏好、关系、约定、重要经历或故事设定，忽略重复寒暄和短暂琐事。category 是简短类别；新建时 origin 简述初始记忆由来；更新已有条目时 origin 必须逐字复制其已有值，不因本轮来源或措辞变化而改写，新的依据由程序追加到来源轨迹。importance 为1至5整数。",
+      "输入 json_templates 提供可直接填写的根JSON模板和两种条目模板。只返回填好的根对象，条目按需放入更新数组；不要把模板说明、占位文字或 item_template 键返回。repair 存在时根据其中安全错误码和字段位置修正上次输出，再给完整JSON，不盲目生成相同错误。",
       "status 为 active/superseded/retracted，按新证据修正或标记旧记忆过时，不无依据覆盖、不删除。people是人物数组，evidence必须来自source对应本轮原文；没有 user_email 时不能产生user来源更新。",
       "content不超过4000字符；category/origin/人物名称每项不超过200字符；evidence不超过1000字符。用户的纠正优先保留，计划、假设、玩笑不能无标记地写成既成事实。"
     ]

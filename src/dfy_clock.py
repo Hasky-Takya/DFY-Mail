@@ -15,7 +15,7 @@ from openai import APIConnectionError, APIStatusError, OpenAIError
 from dfy_receive import MailReceiver, interval_seconds, load_reply_prompt
 from dfy_test import DeepSeekChat
 from dialog_memory import (
-    MEMORY_PATH, PROMPT_PATH, MemoryError, load_story_extraction_prompt, load_summary_prompt, new_record,
+    MEMORY_PATH, PROMPT_PATH, MemoryError, SummaryError, load_story_extraction_prompt, load_summary_prompt, new_record,
     render_prompt, send_recorded, summarize,
 )
 from mail import DEFAULT_CONFIG, MailClient, _load_settings
@@ -187,8 +187,13 @@ class IdleMailScheduler:
                 history=[{key: item[key] for key in ("type", "received_at", "sent_at", "user_summary", "assistant_summary")}
                          for item in draft["snapshot"]["dialogs"]],
                 anchors={"as_of": self.now().isoformat(), "received_at": None},
+                validation_feedback=draft.get("validation_feedback"),
             )
         except (OpenAIError, ValueError) as exc:
+            if isinstance(exc, SummaryError):
+                draft["validation_feedback"] = exc.repair_feedback()
+                logger.warning("主动联合提取校验失败，code=%s field=%s。",
+                               exc.details["code"], exc.details["path"])
             self.failures[stage] += 1
             attempts = self.failures[stage]
             temporary = (

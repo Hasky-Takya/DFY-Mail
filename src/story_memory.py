@@ -19,8 +19,61 @@ class StoryError(RuntimeError):
     """Persistence, corruption, or replay conflict; stop the caller."""
 
 
+# Only these controlled descriptions may be logged or sent back to the model.
+_VALIDATION_HINTS = {
+    "invalid_update": "Return an update matching the required JSON schema.",
+    "evidence_not_in_source": "Copy evidence exactly from the selected current source body.",
+    "raw_time_not_in_source": "Copy raw event time exactly from the selected current source body.",
+    "unknown_target": "Use null for a new item or an existing same-kind target ID.",
+    "duplicate_target": "Update each existing target at most once per batch.",
+    "immutable_origin": "Keep the existing memory origin unchanged.",
+    "invalid_fields": "Use exactly the required fields and respect field size and uniqueness limits.",
+    "invalid_enum": "Choose one of the allowed schema values for this field.",
+    "invalid_type": "Use the JSON type required by the schema for this field.",
+    "invalid_time": "Use null or a valid timezone-aware ISO 8601 time; keep end at or after start and retain raw evidence.",
+    "invalid_importance": "Use an integer importance from 1 through 5, not a boolean.",
+    "unknown_related_event": "Reference only event IDs already present in story context.",
+    "source_domain_mismatch": "Use user evidence for user_report/user_preference and llm evidence for assistant_statement.",
+}
+_SAFE_FIELD_PATHS = {
+    "target_id", "evidence", "content", "source", "domain", "importance", "people", "status",
+    "title", "tense", "event_time", "event_time.raw", "event_time.start", "event_time.end",
+    "event_time.anchor", "category", "origin", "related_event_ids", "id", "version",
+    "created_at", "updated_at", "source_refs", "revision", "applied_dialog_ids",
+    "dialog_id", "user_message_id", "assistant_message_id", "received_at_source",
+    "anchors", "anchors.as_of", "anchors.received_at", "anchors.received_at_source",
+}
+_FIELD_NAMES = {
+    "event status": "status", "memory status": "status", "raw event time": "event_time.raw",
+    "source dialog ID": "source_refs", "reference source": "source_refs",
+    "source message ID": "source_refs", "quote": "source_refs",
+}
+
+
+def _safe_path(path):
+    # Never accept model keys, arbitrary dotted paths, or text masquerading as an index.
+    if not isinstance(path, str):
+        return "$"
+    if path == "$" or path in _SAFE_FIELD_PATHS or path in {"event_updates", "memory_updates"}:
+        return path
+    match = re.fullmatch(r"(event_updates|memory_updates)\[([0-9]{1,2})\](?:\.(.+))?", path)
+    if match and int(match[2]) < 32 and (match[3] is None or match[3] in _SAFE_FIELD_PATHS):
+        return path
+    return "$"
+
+
 class StoryValidationError(ValueError):
-    """Untrusted extraction did not satisfy the evidence/schema contract."""
+    """Untrusted extraction failed; safe_details excludes exception text and values."""
+
+    def __init__(self, message, *, code="invalid_update", path="$"):
+        super().__init__(message)
+        self.code = code if isinstance(code, str) and code in _VALIDATION_HINTS else "invalid_update"
+        self.path = _safe_path(path)
+
+    def safe_details(self):
+        # Re-check public attributes so even accidental reassignment cannot leak data.
+        code = self.code if isinstance(self.code, str) and self.code in _VALIDATION_HINTS else "invalid_update"
+        return {"code": code, "path": _safe_path(self.path), "hint": _VALIDATION_HINTS[code]}
 
 
 MAX_UPDATES = 32
@@ -38,8 +91,21 @@ def empty_context() -> dict:
     return {"revision": 0, "applied_dialog_ids": [], "events": [], "memories": []}
 
 
-def _fail(message):
-    raise StoryValidationError(message)
+def _fail(message, *, code="invalid_update", path="$"):
+    raise StoryValidationError(message, code=code, path=path)
+
+
+def _field_path(name):
+    # name is a developer-supplied schema label, never an input dictionary key.
+    return _safe_path(_FIELD_NAMES.get(name, name))
+
+
+def _update_fields(item, kind, prefix):
+    try:
+        _fields(item, kind)
+    except StoryValidationError as exc:
+        exc.path = _safe_path(prefix if exc.path == "$" else f"{prefix}.{exc.path}")
+        raise
 
 
 def _json_loads(text):
@@ -66,60 +132,70 @@ def _string(value, name, limit=200, *, nullable=False, empty=False):
     if value is None and nullable:
         return
     if not isinstance(value, str) or len(value) > limit or (not empty and not value.strip()):
-        _fail(f"Invalid {name}.")
+        _fail(f"Invalid {name}.", code="invalid_type" if not isinstance(value, str) else "invalid_fields",
+              path=_field_path(name))
 
 
 def _integer(value, name, minimum=0):
     if type(value) is not int or value < minimum:
-        _fail(f"Invalid {name}.")
+        _fail(f"Invalid {name}.", code="invalid_importance" if name == "importance" else "invalid_type",
+              path=_field_path(name))
 
 
-def _time(value):
-    _string(value, "timezone-aware ISO timestamp", 100)
+def _time(value, name="timezone-aware ISO timestamp"):
+    path = _field_path(name)
+    try:
+        _string(value, "timezone-aware ISO timestamp", 100)
+    except StoryValidationError as exc:
+        exc.code = "invalid_time"
+        exc.path = path
+        raise
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])", value):
-        _fail("Timestamp must be timezone-aware ISO 8601.")
+        _fail("Timestamp must be timezone-aware ISO 8601.", code="invalid_time", path=path)
     try:
         parsed = datetime.fromisoformat(value)
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             raise ValueError
         return parsed
     except (TypeError, ValueError):
-        _fail("Timestamp must be timezone-aware ISO 8601.")
+        _fail("Timestamp must be timezone-aware ISO 8601.", code="invalid_time", path=path)
 
 
 def _enum(value, choices, name):
     if not isinstance(value, str) or value not in choices:
-        _fail(f"Invalid {name}.")
+        _fail(f"Invalid {name}.", code="invalid_enum" if isinstance(value, str) else "invalid_type",
+              path=_field_path(name))
 
 
 def _strings(values, name, limit=32):
     if not isinstance(values, list) or len(values) > limit:
-        _fail(f"Invalid {name} list.")
+        _fail(f"Invalid {name} list.", code="invalid_fields" if isinstance(values, list) else "invalid_type",
+              path=_field_path(name))
     for value in values:
         _string(value, name)
     if len(values) != len(set(values)):
-        _fail(f"Duplicate {name}.")
+        _fail(f"Duplicate {name}.", code="invalid_fields", path=_field_path(name))
 
 
 def _fields(item, kind, *, stored=False):
     if not isinstance(item, dict):
-        _fail("Update must be an object.")
+        _fail("Update must be an object.", code="invalid_type")
     fields = COMMON | (EVENT if kind == "events" else MEMORY)
     required = fields | (GENERATED if stored else {"target_id", "evidence"})
     if not stored and kind == "memories":
         required = required - {"related_event_ids"}
     if not required <= item.keys() or item.keys() - (required | {"related_event_ids"} if kind == "memories" else required):
-        _fail("Unknown or missing update fields.")
+        _fail("Unknown or missing update fields.", code="invalid_fields")
     _string(item["content"], "content", MAX_TEXT)
     _enum(item["source"], {"user", "llm"}, "source")
     _enum(item["domain"], DOMAINS, "domain")
     required_source = {"user_report": "user", "user_preference": "user",
                        "assistant_statement": "llm"}.get(item["domain"])
     if required_source is not None and item["source"] != required_source:
-        _fail("Domain does not match its evidence source.")
+        _fail("Domain does not match its evidence source.", code="source_domain_mismatch", path="domain")
     _integer(item["importance"], "importance", 1)
     if item["importance"] > 5:
-        _fail("Importance must be between 1 and 5.")
+        _fail("Importance must be between 1 and 5.", code="invalid_importance", path="importance")
     _strings(item["people"], "people")
     if kind == "events":
         _string(item["title"], "title")
@@ -128,18 +204,19 @@ def _fields(item, kind, *, stored=False):
         event_time = item["event_time"]
         expected_time = {"raw", "start", "end", "anchor"} if stored else {"raw", "start", "end"}
         if not isinstance(event_time, dict) or set(event_time) != expected_time:
-            _fail("Invalid event_time.")
+            _fail("Invalid event_time.", code="invalid_fields" if isinstance(event_time, dict) else "invalid_type",
+                  path="event_time")
         if stored:
-            _time(event_time["anchor"])
+            _time(event_time["anchor"], "event_time.anchor")
         _string(event_time["raw"], "raw event time", 200, nullable=True)
         for field in ("start", "end"):
             if event_time[field] is not None:
-                _time(event_time[field])
+                _time(event_time[field], f"event_time.{field}")
         if event_time["start"] is not None and event_time["end"] is not None:
-            if _time(event_time["end"]) < _time(event_time["start"]):
-                _fail("Event end precedes start.")
+            if _time(event_time["end"], "event_time.end") < _time(event_time["start"], "event_time.start"):
+                _fail("Event end precedes start.", code="invalid_time", path="event_time.end")
         if event_time["raw"] is None and any(event_time[k] is not None for k in ("start", "end")):
-            _fail("Normalized event time needs raw evidence.")
+            _fail("Normalized event time needs raw evidence.", code="invalid_time", path="event_time.raw")
     else:
         _enum(item["status"], {"active", "superseded", "retracted"}, "memory status")
         _string(item["category"], "category")
@@ -237,7 +314,8 @@ def validate_updates(raw, *, story_context, user_body, assistant_body, anchors=N
         except ValueError:
             _fail("Extraction is not JSON.")
     if not isinstance(raw, dict) or set(raw) != {"event_updates", "memory_updates"}:
-        _fail("Extraction must contain only event_updates and memory_updates.")
+        _fail("Extraction must contain only event_updates and memory_updates.",
+              code="invalid_fields" if isinstance(raw, dict) else "invalid_type")
     if user_body is not None and not isinstance(user_body, str):
         _fail("User body must be text or null.")
     if not isinstance(assistant_body, str):
@@ -248,7 +326,7 @@ def validate_updates(raw, *, story_context, user_body, assistant_body, anchors=N
         _fail("Program anchors must be a time metadata mapping.")
     for key in ("as_of", "received_at"):
         if anchors.get(key) is not None:
-            _time(anchors[key])
+            _time(anchors[key], f"anchors.{key}")
     if anchors.get("received_at_source") is not None:
         _enum(anchors["received_at_source"], {"imap_internaldate", "observed_at", "unknown"}, "received_at_source")
     clean_secrets = tuple(s for s in secrets if isinstance(s, str) and s)
@@ -257,34 +335,43 @@ def validate_updates(raw, *, story_context, user_body, assistant_body, anchors=N
     for kind, key in (("events", "event_updates"), ("memories", "memory_updates")):
         updates = result[key]
         if not isinstance(updates, list) or len(updates) > MAX_UPDATES:
-            _fail("Too many updates or not an array.")
+            _fail("Too many updates or not an array.",
+                  code="invalid_fields" if isinstance(updates, list) else "invalid_type", path=key)
         existing = {item["id"]: item for item in story_context[kind]}
         seen = set()
         for index, item in enumerate(updates):
-            _fields(item, kind)
+            prefix = f"{key}[{index}]"
+            _update_fields(item, kind, prefix)
             target = item["target_id"]
             if target is not None:
-                if target not in existing or target in seen:
-                    _fail("Target must be an existing same-kind ID updated only once per batch.")
+                if target not in existing:
+                    _fail("Target must be an existing same-kind ID updated only once per batch.",
+                          code="unknown_target", path=f"{prefix}.target_id")
+                if target in seen:
+                    _fail("Target must be an existing same-kind ID updated only once per batch.",
+                          code="duplicate_target", path=f"{prefix}.target_id")
                 seen.add(target)
                 if kind == "memories" and item["origin"] != existing[target]["origin"]:
-                    _fail("Memory origin is immutable.")
+                    _fail("Memory origin is immutable.", code="immutable_origin", path=f"{prefix}.origin")
             body = user_body if item["source"] == "user" else assistant_body
             if body is None or item["evidence"] not in body:
-                _fail("Evidence must be an exact substring of this source body.")
+                _fail("Evidence must be an exact substring of this source body.",
+                      code="evidence_not_in_source", path=f"{prefix}.evidence")
             if kind == "events":
                 event_time = item["event_time"]
                 if event_time["raw"] is not None and event_time["raw"] not in body:
-                    _fail("Raw event time must occur in the source body.")
+                    _fail("Raw event time must occur in the source body.",
+                          code="raw_time_not_in_source", path=f"{prefix}.event_time.raw")
             else:
                 item.setdefault("related_event_ids", [])
                 if not set(item["related_event_ids"]) <= event_ids:
-                    _fail("Related events must already exist in story context.")
+                    _fail("Related events must already exist in story context.",
+                          code="unknown_related_event", path=f"{prefix}.related_event_ids")
             cleaned = _redact(item, clean_secrets)
-            _fields(cleaned, kind)
+            _update_fields(cleaned, kind, prefix)
             # Redacting identifiers cannot silently retarget an update/reference.
             if cleaned["target_id"] != target or (kind == "memories" and cleaned["related_event_ids"] != item["related_event_ids"]):
-                _fail("A credential overlaps a story identifier.")
+                _fail("A credential overlaps a story identifier.", path=prefix)
             updates[index] = cleaned
     return result
 
