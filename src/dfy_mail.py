@@ -12,7 +12,7 @@ from openai import OpenAIError
 from dfy_test import DeepSeekChat
 from dialog_memory import (
     DialogMemory, MEMORY_PATH, MemoryError, SummaryError, load_story_extraction_prompt, load_summary_prompt,
-    new_record, render_email_prompt, send_recorded, summarize,
+    new_record, recent_proactive_subjects, render_email_prompt, send_recorded, summarize,
 )
 from mail import MailClient, _load_settings
 from mail_logging import close_logging, set_log_secrets, start_logging
@@ -77,6 +77,7 @@ def send_deepseek_email(
                 history=[{key: item[key] for key in ("type", "received_at", "sent_at", "user_summary", "assistant_summary")}
                          for item in snapshot["dialogs"]],
                 validation_feedback=validation_feedback,
+                generate_subject=True, recent_subjects=recent_proactive_subjects(snapshot),
             )
             break
         except SummaryError as exc:
@@ -85,8 +86,9 @@ def send_deepseek_email(
                            exc.details["code"], exc.details["path"], attempt + 1)
             if attempt == 2:
                 raise MemoryError("主动邮件梗概连续三次不合格，未发送邮件。") from None
-    record = new_record(snapshot, None, summaries)
-    return send_recorded(memory, snapshot, record, mailbox, prompt["subject"], body)
+    subject = summaries["mail_subject"]
+    record = new_record(snapshot, None, summaries, subject=subject)
+    return send_recorded(memory, snapshot, record, mailbox, subject, body)
 
 
 def main() -> None:

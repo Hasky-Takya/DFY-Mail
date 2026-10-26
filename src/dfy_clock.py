@@ -16,7 +16,7 @@ from dfy_receive import MailReceiver, interval_seconds, load_reply_prompt
 from dfy_test import DeepSeekChat
 from dialog_memory import (
     MEMORY_PATH, PROMPT_PATH, MemoryError, SummaryError, load_story_extraction_prompt, load_summary_prompt, new_record,
-    render_prompt, send_recorded, summarize,
+    recent_proactive_subjects, render_prompt, send_recorded, summarize,
 )
 from mail import DEFAULT_CONFIG, MailClient, _load_settings
 from mail_logging import close_logging, set_log_secrets, start_logging
@@ -188,6 +188,7 @@ class IdleMailScheduler:
                          for item in draft["snapshot"]["dialogs"]],
                 anchors={"as_of": self.now().isoformat(), "received_at": None},
                 validation_feedback=draft.get("validation_feedback"),
+                generate_subject=True, recent_subjects=recent_proactive_subjects(draft["snapshot"]),
             )
         except (OpenAIError, ValueError) as exc:
             if isinstance(exc, SummaryError):
@@ -216,12 +217,13 @@ class IdleMailScheduler:
             self.draft = None
             logger.info("主动草稿已取消：用户活动、记忆或邮箱同步状态发生变化。")
             return
-        record = new_record(draft["snapshot"], None, draft["summaries"])
+        subject = draft["summaries"]["mail_subject"]
+        record = new_record(draft["snapshot"], None, draft["summaries"], subject=subject)
         self.stopped = True  # 任何发送异常都不得再次 tick 重发。
         logger.info("发送主动邮件，结果未确认前不重入发送。")
         send_recorded(
             self.receiver.memory, draft["snapshot"], record, self.receiver.mailbox,
-            self.prompts["subject"], draft["body"],
+            subject, draft["body"],
         )
         logger.info("主动邮件已由 SMTP 接受且记忆确认，不保证最终投递。")
         self.stopped = False

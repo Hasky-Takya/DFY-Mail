@@ -21,7 +21,8 @@
 | 人设与提示词 | 支持，在 `config/prompt.json` 中配置 |
 | 运行状态日志 | 所有入口支持，分别写入 `log/output_log/*.log` |
 | 随机空闲主动来信 | 支持，`dfy_clock.py` 统一收信回复与随机等待后主动发信 |
-| 附件、图片理解 | **不支持** |
+| 图片理解 | 支持JPEG/PNG/GIF/WebP附件及HTML引用的CID图；不抓远程图 |
+| 其他附件理解 | 不支持PDF/Office/音视频等非图像附件 |
 | 多用户、网页管理、向量检索 | **不支持** |
 | 停机补信、完整正文历史、持久化待处理队列 | **不支持** |
 
@@ -43,6 +44,8 @@
 │  ├─ dfy_clock.py              # 统一收信回复及随机主动来信
 │  ├─ dialog_memory.py          # 梗概、历史上下文与发送记录
 │  ├─ story_memory.py           # 事件／长期记忆校验与可恢复投影
+│  ├─ mail_images.py            # MIME图片提取、限额与Pillow验证
+│  ├─ vision.py                 # 缓存视觉观察与规范化来信
 │  └─ mail_logging.py           # 日志轮转及脱敏
 ├─ memory/
 │  ├─ dialog.json               # 对话梗概及已验证的故事更新包
@@ -66,7 +69,8 @@
    ├─ test_memory_observation.py
    ├─ test_story_memory.py
    ├─ test_story_integration.py
-   └─ test_extraction_repair.py
+   ├─ test_extraction_repair.py
+   └─ test_vision_features.py
 ```
 
 ## 1. 准备环境
@@ -77,7 +81,7 @@
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-python -m pip install "openai>=1.0.0,<3.0.0"
+python -m pip install -r requirements.txt
 ```
 
 尚未创建虚拟环境时，先执行：
@@ -86,9 +90,9 @@ python -m pip install "openai>=1.0.0,<3.0.0"
 python -m venv .venv
 ```
 
-当前目录未包含 `requirements.txt`，可按上面的命令直接安装所需 SDK；此命令是安装说明，编写文档时未实际执行。项目第三方依赖为 `openai`，用于访问 DeepSeek 的 OpenAI 兼容接口。邮箱、JSON、文件锁和日志使用 Python 标准库；不需要单独安装名为 `mail` 的包。
+依赖见 `requirements.txt`：`openai` 用于API调用，`Pillow` 用于实际图像格式、像素和解码校验。上述命令由部署者执行，代码编写时未自动安装。邮箱、JSON、文件锁和日志使用标准库，不需要安装名为 `mail` 的包。缺Pillow时遇到附图会明确停止提示安装，不把未校验图像直接上传。
 
-当前客户端默认使用 `https://api.deepseek.com` 和 `deepseek-chat`。需要其他模型时，在调用 `DeepSeekChat` 时传入 `model`；现有脚本尚未提供模型配置项或命令行选项。
+当前客户端默认使用 `https://api.deepseek.com` 和 `deepseek-flash`（服务商当前映射到V4.1 Flash的滚动别名），通过 `extra_body` 明确关闭思考模式，保持非思考邮件交互。需要其他模型时可在创建 `DeepSeekChat` 时传 `model`；默认接口支持text与image_url多模态内容块。
 
 ## 2. 配置邮箱
 
@@ -205,13 +209,29 @@ python src/dfy_clock.py
 4. 主动发送被 SMTP 接受且记忆确认后，重新抽取（如 210），从发送成功时重新计时。用户始终不回也会继续按新随机间隔主动来信，本版没有每日上限或免打扰。
 5. 等待期间收到有效用户新邮件，重新抽取并从服务器接收时间计时；普通回复的完成时间不会额外重置。
 
-`positive_prompt.json` 的 `prompt` 是持续主动找话题的任务，`subject` 是主动邮件主题。这里只会依据历史和人设生成话题，**没有联网搜索功能**，不会调用 `prompt.json` 中仅用于第一封问候的 `send_task`。
+`positive_prompt.json` 的 `prompt` 是持续主动找话题的任务，`subject` 保留旧配置兼容，实际主题由模型依据本封正文动态生成。这里只会依据历史和人设生成话题，**没有联网搜索功能**，不会调用 `prompt.json` 中仅用于第一封问候的 `send_task`。
 
 计时使用单调时钟；重启会重新抽样，但仍参考最近用户来信与成功主动发送时间，不会无条件立刻再发。休眠恢复不补发多封。最近历史邮件按 UID 倒序选择，只读必要头部和 INTERNALDATE；无可靠接收时间时保守从启动观察时间开始。历史查询不检查正文是否为空；实时来信沿用非空正文才接纳的规则，自动回复、退信、重复信和空正文不重置。
 
 邮箱检查失败或有待回复消息时不主动发送；生成和摘要暂时失败分阶段最多尝试三次，摘要重试可复用正文。记忆有未核验状态、UIDVALIDITY 改变、SMTP 结果不确定时停止，禁止盲目重发。最后检查与 SMTP 之间仍有很短的到信窗口，普通轮询不能实现绝对原子判断。启动前旧邮件只用于判断空闲，不自动补回复。
 
 状态日志在 `log/output_log/dfy_clock.log`，包含抽中的分钟数与重置原因，不保存正文、话题、提示词或密钥。
+
+### 图片来信
+
+用户可以附上JPEG、PNG、GIF或WebP，也可以发送只有图片的邮件。程序识别普通图片附件和当前HTML正文真正引用的CID内嵌图，按内容哈希去重；不请求远程链接、不读取转发.eml中的历史图。
+
+单封最多4张、单张5MiB、合计10MiB、每张最多2000万像素。两条正文读取路径先查邮件RFC822.SIZE；超过30MiB或大小未知时只读头部，回复无法处理的说明，不下载整封。损坏、格式不支持、超限图片会给出处理通知，合规内容仍可处理；动图仅看首帧并明确说明，不承诺理解完整动画。Pillow用于内容而非文件名判断格式。
+
+含有效图片的来信通常为**三次模型调用**：视觉观察一次、正文回复一次、摘要／结构化记忆提取一次。视觉观察结果缓存，摘要修复不重复识图；成功识图后释放原始字节。所有图片会作为API请求上传DeepSeek，原图/base64不写日志或记忆，但有界图片描述/OCR/不确定性会随sent对话保存，仍需保护隐私。多封突发邮件仍可能增加进程内存占用。
+
+回复和记忆使用同一份标注图片ID的视觉观察，不把它当用户原话。图片来源证据在source_refs中标为image_observation及image_ids，图像独立支持的事件／记忆保守记为uncertain；旧五字段引用照常兼容。图片文字属于不可信资料，不能指挥程序改配置或泄密。
+
+### 主动主题
+
+主动邮件的主题不再固定使用配置中的“想和你聊聊”。程序在原有第二次提取请求中同时要求 `mail_subject`，根据最终正文生成1至60字的具体自然主题，并参考最近10个已确认主动主题避免规范化后完全重复。主题与实际发送/保存一致，重启仍可参考历史。语义近似只能尽量避免，不承诺永不相似。
+
+主题不合格会进入原有安全反馈修复，最多三次；不重新生成正文、不额外增加纯文字API请求，不偷偷回落固定主题。配置subject保留旧配置兼容但不再决定正常主动发送主题。普通回复的Re、In-Reply-To和References保持不变。
 
 ## 4. 其他脚本用法
 
@@ -273,7 +293,7 @@ python src/mail.py --config config/settings.json read --limit 5
 | `reply_task` | 正常回复的任务要求，与共同人设组合 |
 | `send_task` | 手动 `dfy_mail.py` 主动任务，无历史才首次问候，有历史自然延续 |
 | `story_extraction_prompt` | 联合提取事件／长期记忆的可编辑四字段协议；存在时启用 |
-| `subject` | 手动主动邮件主题；正常回复仍使用原主题的 `Re:` |
+| `subject` | 保留旧配置兼容，主动实际主题动态生成；正常回复使用 `Re:` |
 | `summary_prompt` | 提炼双方梗概，要求返回固定字段的 JSON |
 
 `positive_prompt.json` 单独保存周期主动任务及主题；`dfy_clock.py` 复用共同人设，不再复制一整份角色设定。**修改 TXT 不会自动同步到 JSON**；配置和提示词修改后需重启相应脚本。

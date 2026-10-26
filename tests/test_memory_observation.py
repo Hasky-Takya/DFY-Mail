@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from test_receive import SUMMARY, mail, memory_module, message, mock_send, receive
+from test_receive import mail, memory_module, message, mock_send, mock_summary, receive
 from test_clock import clock
 
 
@@ -23,7 +23,7 @@ class ObservationTests(unittest.TestCase):
         self.box.get_mailbox_cursor.return_value = (10, 0)
         self.box.send_email.side_effect = mock_send
         self.bot = MagicMock()
-        self.bot.ask.side_effect = lambda question, **kwargs: SUMMARY if kwargs.get("json_mode") else "answer"
+        self.bot.ask.side_effect = lambda question, **kwargs: mock_summary(question) if kwargs.get("json_mode") else "answer"
         self.receiver = receive.MailReceiver(self.box, self.bot, "reply", memory_path=Path(self.tmp.name) / "dialog.json", summary_prompt="summary")
 
     def test_current_and_batch_activities_provided_without_other_body(self):
@@ -132,7 +132,7 @@ class ObservationTests(unittest.TestCase):
         self.box.latest_user_activity.return_value = {"uid": "5", "uidvalidity": "10", "received_at": None, "received_at_source": "unknown"}
         self.box.get_mailbox_cursor.return_value = (10, 5)
         self.box.read_user_emails_since.return_value = ((10, 5), [])
-        self.bot.ask.side_effect = ["answer", json.dumps({"user_summary": None, "assistant_summary": "new topic"})]
+        self.bot.ask.side_effect = ["answer", json.dumps({"user_summary": None, "assistant_summary": "new topic", "mail_subject": "聊聊最近的新发现"})]
         prompts = {"task": "topic", "system_prompt": "persona", "summary_prompt": "summary", "subject": "subject"}
         scheduler = clock.IdleMailScheduler(self.receiver, prompts, {}, randint=lambda low, high: 60, now=lambda: wall[0], monotonic=lambda: mono[0])
         scheduler.start()
@@ -150,7 +150,7 @@ class ObservationTests(unittest.TestCase):
         }
         self.box.get_mailbox_cursor.return_value = (10, 5)
         self.box.read_user_emails_since.return_value = ((10, 5), [])
-        proactive_summary = json.dumps({"user_summary": None, "assistant_summary": "new topic"})
+        proactive_summary = json.dumps({"user_summary": None, "assistant_summary": "new topic", "mail_subject": "聊聊最近的新发现"})
         self.bot.ask.side_effect = ["answer", proactive_summary]
         prompts = {"task": "topic", "system_prompt": "persona", "summary_prompt": "summary", "subject": "subject"}
         scheduler = clock.IdleMailScheduler(self.receiver, prompts, {}, randint=lambda low, high: 60, now=lambda: now, monotonic=lambda: 1000)

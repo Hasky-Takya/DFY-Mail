@@ -20,6 +20,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from mail_logging import close_logging, set_log_secrets, start_logging
+from mail_images import extract_images, public_mail
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "config" / "settings.json"
@@ -226,6 +227,24 @@ class MailClient:
         with self._smtp():
             pass
 
+    def _fetch_bounded(self, connection, uid):
+        status, size_data = self._imap_command("UID FETCH 查询大小", connection.uid, "fetch", uid, "(RFC822.SIZE)")
+        if status != "OK":
+            raise imaplib.IMAP4.error("查询邮件大小失败。")
+        metadata = b" ".join(part for part in (size_data or []) if isinstance(part, bytes))
+        sizes = re.findall(rb"RFC822\.SIZE\s+(\d+)", metadata, re.I)
+        warning = None
+        if len(sizes) != 1:
+            warning = "mail_size_unknown"
+        elif int(sizes[0]) > 30 * 1024 * 1024:
+            warning = "mail_too_large"
+        query = "(INTERNALDATE BODY.PEEK[HEADER])" if warning else "(INTERNALDATE BODY.PEEK[])"
+        status, parts = self._imap_command("UID FETCH 读取正文", connection.uid, "fetch", uid, query)
+        if status != "OK":
+            raise imaplib.IMAP4.error("读取邮件失败。")
+        raw, received_at = _fetch_email_data(parts)
+        return raw, received_at, warning
+
     def read_user_emails(self, limit: int = 10) -> list[dict]:
         """读取 INBOX 中最近的用户来信（新到旧），包含已读邮件，不改变已读状态。
 
@@ -243,12 +262,7 @@ class MailClient:
                 raise imaplib.IMAP4.error("搜索用户邮件失败。")
             uids = sorted((data[0] or b"").split(), key=int, reverse=True)
             for uid in uids:
-                status, parts = self._imap_command(
-                    "UID FETCH 读取正文", connection.uid, "fetch", uid, "(INTERNALDATE BODY.PEEK[])"
-                )
-                if status != "OK":
-                    raise imaplib.IMAP4.error("读取邮件失败。")
-                raw, received_at = _fetch_email_data(parts)
+                raw, received_at, image_warning = self._fetch_bounded(connection, uid)
                 if raw is None:
                     continue  # 邮件可能在搜索后被其他客户端移走。
                 parsed = self._parse_user_email(
@@ -257,6 +271,8 @@ class MailClient:
                 )
                 if parsed is None:
                     continue
+                if image_warning:
+                    parsed["image_warnings"].append({"index": 0, "code": image_warning})
                 result.append(parsed)
                 if len(result) == limit:
                     break
@@ -325,7 +341,9 @@ class MailClient:
             (value for key, value in message.raw_items() if key.lower() == "in-reply-to"),
             None,
         )
+        images, image_warnings = extract_images(message)
         return {
+            "images": images, "image_warnings": image_warnings,
             "uid": uid.decode(),
             "uidvalidity": uidvalidity,
             "message_id": str(message.get("Message-ID", "")).strip(),
@@ -484,12 +502,7 @@ class MailClient:
                 if not start <= number <= end:
                     continue
                 uid = str(number).encode()
-                status, parts = self._imap_command(
-                    "UID FETCH 读取正文", connection.uid, "fetch", uid, "(INTERNALDATE BODY.PEEK[])"
-                )
-                if status != "OK":
-                    raise imaplib.IMAP4.error("读取新邮件失败。")
-                raw, received_at = _fetch_email_data(parts)
+                raw, received_at, image_warning = self._fetch_bounded(connection, uid)
                 if raw is None:
                     continue
                 parsed = self._parse_user_email(
@@ -497,6 +510,8 @@ class MailClient:
                     received_at_source="imap_internaldate" if received_at is not None else None,
                 )
                 if parsed is not None:
+                    if image_warning:
+                        parsed["image_warnings"].append({"index": 0, "code": image_warning})
                     result.append(parsed)
             logger.debug("增量读取完成：范围=%s:%s 候选=%s 用户邮件=%s", start, end, len(uids), len(result))
             return current, result
@@ -597,7 +612,7 @@ def main() -> None:
             logger.info("邮件诊断完成，数量=1。")
         elif args.command == "read":
             messages = client.read_user_emails(args.limit)
-            print(json.dumps(messages, ensure_ascii=False, indent=2))
+            print(json.dumps([public_mail(item) for item in messages], ensure_ascii=False, indent=2))
             logger.info("邮件读取完成，数量=%s。", len(messages))
         elif args.command == "send":
             client.send_email(args.subject, args.body)

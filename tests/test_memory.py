@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from test_receive import (
-    SUMMARY, message, memory_module as memory, mail, mock_send, proactive, receive,
+    SUMMARY, fetch_size, message, memory_module as memory, mail, mock_answer, mock_send, proactive, receive,
 )
 
 
@@ -187,7 +187,7 @@ class IntegrationTests(unittest.TestCase):
         self.box, self.bot = MagicMock(), MagicMock()
         self.box.get_mailbox_cursor.return_value = (10, 0)
         self.box.send_email.side_effect = mock_send
-        self.bot.ask.side_effect = lambda question, **kw: SUMMARY if kw.get("json_mode") else "回答"
+        self.bot.ask.side_effect = mock_answer
 
     def listener(self):
         result = receive.MailReceiver(self.box, self.bot, "根据正文回答", memory_path=self.path, summary_prompt="JSON summary")
@@ -203,6 +203,7 @@ class IntegrationTests(unittest.TestCase):
         connection.response.side_effect = lambda key: (key, [b"10" if key == "UIDVALIDITY" else b"2"])
         connection.uid.side_effect = [
             ("OK", [b"1"]),
+            fetch_size(b"From: user@example.com\r\n\r\nquestion"),
             ("OK", [(b'1 (INTERNALDATE "25-Oct-2026 08:00:00 +0800" BODY[] {50}', b"From: user@example.com\r\n\r\nquestion")]),
         ]
         from contextlib import contextmanager
@@ -310,7 +311,7 @@ class IntegrationTests(unittest.TestCase):
         snapshot = self.store.snapshot()
         prior = memory.new_record(snapshot, None, {"user_summary": None, "assistant_summary": "之前谈到运动。"})
         memory.send_recorded(self.store, snapshot, prior, self.box, "主题", "正文")
-        self.bot.ask.side_effect = ["基于历史的新邮件", json.dumps({"user_summary": None, "assistant_summary": "再次问候。"})]
+        self.bot.ask.side_effect = ["基于历史的新邮件", json.dumps({"user_summary": None, "assistant_summary": "再次问候。", "mail_subject": "再聊聊最近的运动计划"})]
         self.box._auth_code = "fake-auth"
         with patch.object(proactive, "MailClient", return_value=self.box), patch.object(proactive, "DeepSeekChat", return_value=self.bot):
             result = proactive.send_deepseek_email("fake-key", "fake-auth", config, memory_path=self.path)
@@ -324,6 +325,8 @@ class IntegrationTests(unittest.TestCase):
         self.assertIsNone(saved["received_at"])
         self.assertIsNone(saved["user_summary"])
         self.assertEqual(result, saved["assistant_message_id"])
+        self.assertEqual(self.box.send_email.call_args.args[0], "再聊聊最近的运动计划")
+        self.assertEqual(saved["subject"], "再聊聊最近的运动计划")
 
 
 if __name__ == "__main__":

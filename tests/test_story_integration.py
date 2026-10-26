@@ -16,8 +16,9 @@ BODY = "明天和桃井一起测试游戏。"
 ANSWER = "好，我们明天一起测试游戏！"
 
 
-def combined(user=True, content=BODY, source="user"):
+def combined(user=True, content=BODY, source="user", *, generate_subject=False):
     return json.dumps({
+        **({"mail_subject": "一起试试明天的新游戏"} if generate_subject else {}),
         "user_summary": "用户计划测试游戏。" if user else None,
         "assistant_summary": "助手计划一起测试游戏。",
         "event_updates": [{
@@ -109,24 +110,28 @@ class StoryIntegrationTests(unittest.TestCase):
     def test_manual_entry_uses_joint_protocol(self):
         prompt = self.root / "prompt.json"
         prompt.write_text(json.dumps({"subject": "测试", "prompt": "persona", "summary_prompt": "summary", "story_extraction_prompt": "extract"}), encoding="utf-8")
-        self.bot.ask.side_effect = [ANSWER, combined(False, ANSWER, "llm")]
+        self.bot.ask.side_effect = [ANSWER, combined(False, ANSWER, "llm", generate_subject=True)]
         self.box._auth_code = "fake-auth"
         with patch.object(proactive, "MailClient", return_value=self.box), patch.object(proactive, "DeepSeekChat", return_value=self.bot):
             proactive.send_deepseek_email("fake-api", "fake-auth", prompt, memory_path=self.path)
         self.assertEqual(self.bot.ask.call_count, 2)
+        self.assertEqual(self.box.send_email.call_args.args[0], "一起试试明天的新游戏")
         self.assertEqual(self.store.snapshot(include_story=True)["story_context"]["events"][0]["source"], "llm")
 
     def test_clock_success_commits_story_and_resets(self):
         listener = receive.MailReceiver(self.box, self.bot, "persona", memory_path=self.path, summary_prompt="summary", extraction_prompt="extract")
         prompts = {"task": "topic", "system_prompt": "persona", "subject": "test", "summary_prompt": "summary"}
         mono = [0.0]
-        scheduler = clock.IdleMailScheduler(listener, prompts, {}, randint=lambda a, b: 60, monotonic=lambda: mono[0])
+        scheduler = clock.IdleMailScheduler(listener, prompts, {}, randint=lambda a, b: 60,
+                                            now=lambda: clock.datetime(2026, 10, 25, tzinfo=clock.timezone.utc),
+                                            monotonic=lambda: mono[0])
         scheduler.start()
         self.box.read_user_emails_since.return_value = ((10, 0), [])
         mono[0] = 3600
-        self.bot.ask.side_effect = [ANSWER, combined(False, ANSWER, "llm")]
+        self.bot.ask.side_effect = [ANSWER, combined(False, ANSWER, "llm", generate_subject=True)]
         scheduler.tick()
         self.box.send_email.assert_called_once()
+        self.assertEqual(self.box.send_email.call_args.args[0], "一起试试明天的新游戏")
         self.assertEqual(self.store.snapshot(include_story=True)["story_context"]["revision"], 1)
         self.assertEqual(scheduler.deadline, 7200)
         self.assertEqual(self.bot.ask.call_count, 2)
@@ -135,10 +140,12 @@ class StoryIntegrationTests(unittest.TestCase):
         listener = receive.MailReceiver(self.box, self.bot, "persona", memory_path=self.path, summary_prompt="summary", extraction_prompt="extract")
         prompts = {"task": "topic", "system_prompt": "persona", "subject": "test", "summary_prompt": "summary"}
         mono = [0.0]
-        scheduler = clock.IdleMailScheduler(listener, prompts, {}, randint=lambda a, b: 60, monotonic=lambda: mono[0])
+        scheduler = clock.IdleMailScheduler(listener, prompts, {}, randint=lambda a, b: 60,
+                                            now=lambda: clock.datetime(2026, 10, 25, tzinfo=clock.timezone.utc),
+                                            monotonic=lambda: mono[0])
         scheduler.start()
         mono[0] = 3600
-        self.bot.ask.side_effect = [ANSWER, combined(False, ANSWER, "llm")]
+        self.bot.ask.side_effect = [ANSWER, combined(False, ANSWER, "llm", generate_subject=True)]
         self.box.read_user_emails_since.side_effect = [((10, 0), []), mail.imaplib.IMAP4.abort("temporary")]
         scheduler.tick()
         self.box.send_email.assert_not_called()

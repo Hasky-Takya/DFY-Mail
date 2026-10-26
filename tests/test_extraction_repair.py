@@ -69,12 +69,15 @@ class ExtractionRepairTests(unittest.TestCase):
         prompt = self.root / "prompt.json"
         prompt.write_text(json.dumps({"subject": "test", "prompt": "persona", "summary_prompt": "summary", "story_extraction_prompt": "extract"}), encoding="utf-8")
         self.box._auth_code = "fake-auth"
-        self.bot.ask.side_effect = [ANSWER, combined(False, "PRIVATE WRONG QUOTE", "llm"), combined(False, ANSWER, "llm")]
+        self.bot.ask.side_effect = [ANSWER, combined(False, "PRIVATE WRONG QUOTE", "llm", generate_subject=True), combined(False, ANSWER, "llm", generate_subject=True)]
         with patch.object(proactive, "MailClient", return_value=self.box), patch.object(proactive, "DeepSeekChat", return_value=self.bot):
             proactive.send_deepseek_email("fake-api", "fake-auth", prompt, memory_path=self.root / "dialog.json")
         self.assertEqual(self.bot.ask.call_count, 3)
         self.box.send_email.assert_called_once()
-        self.assertIn("repair", json.loads(self.bot.ask.call_args_list[2].args[0]))
+        self.assertEqual(self.box.send_email.call_args.args[0], "一起试试明天的新游戏")
+        repaired = json.loads(self.bot.ask.call_args_list[2].args[0])
+        self.assertIn("repair", repaired)
+        self.assertEqual(repaired["repair"]["error"]["code"], "evidence_not_in_source")
 
     def test_clock_repair_and_three_attempt_limit(self):
         listener = receive.MailReceiver(self.box, self.bot, "persona", memory_path=self.root / "dialog.json", summary_prompt="summary", extraction_prompt="extract")
@@ -84,7 +87,7 @@ class ExtractionRepairTests(unittest.TestCase):
         scheduler.start()
         mono[0] = 3600
         self.box.read_user_emails_since.return_value = ((10, 0), [])
-        self.bot.ask.side_effect = [ANSWER, combined(False, "BAD QUOTE", "llm"), combined(False, "BAD QUOTE", "llm"), combined(False, "BAD QUOTE", "llm")]
+        self.bot.ask.side_effect = [ANSWER, combined(False, "BAD QUOTE", "llm", generate_subject=True), combined(False, "BAD QUOTE", "llm", generate_subject=True), combined(False, "BAD QUOTE", "llm", generate_subject=True)]
         scheduler.tick()
         scheduler.tick()
         with self.assertRaises(RuntimeError):
@@ -101,12 +104,12 @@ class ExtractionRepairTests(unittest.TestCase):
         scheduler.start()
         self.box.read_user_emails_since.return_value = ((10, 0), [])
         mono[0] = 3600
-        self.bot.ask.side_effect = [ANSWER, combined(False, "BAD QUOTE", "llm")]
+        self.bot.ask.side_effect = [ANSWER, combined(False, "BAD QUOTE", "llm", generate_subject=True)]
         scheduler.tick()
         self.assertIn("validation_feedback", scheduler.draft)
         scheduler.on_user_message({"received_at": clock.utc_now().isoformat()})
         self.assertIsNone(scheduler.draft)
-        self.bot.ask.side_effect = [ANSWER, combined(False, ANSWER, "llm")]
+        self.bot.ask.side_effect = [ANSWER, combined(False, ANSWER, "llm", generate_subject=True)]
         mono[0] += 3600
         scheduler.tick()
         request = json.loads(self.bot.ask.call_args_list[-1].args[0])

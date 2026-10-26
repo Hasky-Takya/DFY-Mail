@@ -18,10 +18,11 @@ from openai import APIConnectionError, APIStatusError, OpenAIError
 from dfy_test import DeepSeekChat
 from dialog_memory import (
     DialogMemory, MEMORY_PATH, MemoryError, SummaryError, load_story_extraction_prompt, load_summary_prompt, new_record,
-    now_iso, render_email_prompt, resolve_reply, send_recorded, summarize,
+    now_iso, redact, render_email_prompt, resolve_reply, send_recorded, summarize,
 )
 from mail import MailboxStateError, MailClient, _load_settings
 from mail_logging import close_logging, set_log_secrets, start_logging
+from vision import normalize_user_content, observe_images
 
 
 logger = logging.getLogger("dfy.receive")
@@ -194,7 +195,7 @@ class MailReceiver:
             message.setdefault("received_at", now_iso())
             message.setdefault("received_at_source", "observed_at")
             self.observe_user_activity(message)
-            if not message["body"].strip():
+            if not message["body"].strip() and not message.get("images") and not message.get("image_warnings"):
                 logger.info("跳过空正文邮件，UID=%s", message["uid"])
                 continue
             self.pending.append({"message": message, "attempts": 0})
@@ -208,18 +209,29 @@ class MailReceiver:
             message = task["message"]
             if "snapshot" not in task:
                 task["snapshot"] = self.memory.snapshot(include_story=self.extraction_prompt is not None)
-            question = self.memory.question(task["snapshot"], (
-                f"邮件主题：{message['subject']}\n\n用户邮件正文：\n{message['body']}"
-            ), mode="reply", current_message=message,
-                observed_user_activity=self.observed_user_activity,
-                observation=self.observation, as_of=now_iso(),
-                story_context=task["snapshot"].get("story_context"))
             logger.info(
                 "正在为 UID=%s 调用 DeepSeek，attempt=%s body_chars=%s",
                 message["uid"], task["attempts"] + 1, len(message["body"]),
             )
             started = time.perf_counter()
             try:
+                if "user_content" not in task:
+                    observations = []
+                    if message.get("images"):
+                        observations = observe_images(self.bot, message["body"], message["images"])
+                    observations = json.loads(redact(json.dumps(observations, ensure_ascii=False), self.memory.secrets))
+                    task["image_observations"] = observations
+                    task["user_content"], task["user_evidence"] = normalize_user_content(
+                        message["body"], observations, message.get("image_warnings", []),
+                    )
+                    message.pop("images", None)
+                    task["attempts"] = 0
+                question = self.memory.question(task["snapshot"], (
+                    f"邮件主题：{message['subject']}\n\n用户邮件正文与附图观察：\n{task['user_content']}"
+                ), mode="reply", current_message=message,
+                    observed_user_activity=self.observed_user_activity,
+                    observation=self.observation, as_of=now_iso(),
+                    story_context=task["snapshot"].get("story_context"))
                 if "body" not in task:
                     task["body"] = self.bot.ask(question, system_prompt=self.reply_prompt)
                     logger.info("DeepSeek 生成完成，UID=%s duration=%.2fs", message["uid"], time.perf_counter() - started)
@@ -227,7 +239,8 @@ class MailReceiver:
                 if "summaries" not in task:
                     logger.info("正在提炼双方梗概，UID=%s", message["uid"])
                     task["summaries"] = summarize(
-                        self.bot, self.summary_prompt, message["body"], task["body"], secrets=self.memory.secrets,
+                        self.bot, self.summary_prompt, task["user_content"], task["body"], secrets=self.memory.secrets,
+                        user_evidence=task["user_evidence"],
                         story_context=task["snapshot"].get("story_context"), extraction_prompt=self.extraction_prompt,
                         history=[{key: item[key] for key in ("type", "received_at", "sent_at", "user_summary", "assistant_summary")}
                                  for item in task["snapshot"]["dialogs"]],
@@ -264,7 +277,8 @@ class MailReceiver:
             # 从此处起任何中断都不得重新进入 SMTP；磁盘上保留可核验状态。
             self.stopped = True
             try:
-                record = new_record(task["snapshot"], message, task["summaries"])
+                record = new_record(task["snapshot"], message, task["summaries"],
+                                    image_observations=task.get("image_observations"))
                 send_recorded(
                     self.memory, task["snapshot"], record, self.mailbox,
                     reply_subject(message["subject"]), body,

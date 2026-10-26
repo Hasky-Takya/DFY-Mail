@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import unicodedata
 import re
 import tempfile
 import uuid
@@ -10,6 +11,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import make_msgid
 from pathlib import Path
+
+from vision import VisionError, validate_observations
 
 from story_memory import (
     StoryError, StoryValidationError, materialize_updates, reconcile_locked,
@@ -75,6 +78,25 @@ def extraction_template(user_present: bool) -> dict:
             "已有memory.origin不可修改，related_event_ids只能用本次已提供的已有事件ID。"
         ),
     }
+
+
+def validate_subject(value, recent_subjects=()):
+    if (not isinstance(value, str) or not 1 <= len(value.strip()) <= 60
+            or any(unicodedata.category(char).startswith("C") or char in "  " for char in value)
+            or re.match(r"(?i)^\s*(?:subject|主题|re|fw|fwd)\s*[:：]", value)):
+        raise ValueError("主题必须是1至60字的安全单行文本，无标签或回复前缀。")
+    value = value.strip()
+    normalized = lambda text: " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+    if any(normalized(value) == normalized(old) for old in recent_subjects):
+        raise ValueError("主题与近期主动邮件重复。")
+    return value
+
+
+def recent_proactive_subjects(snapshot, limit=10):
+    records = sorted((item for item in snapshot["dialogs"]
+                      if item["status"] == "sent" and item["type"] == "deepseek自己主动发送"
+                      and isinstance(item.get("subject"), str)), key=lambda item: _time(item["sent_at"]), reverse=True)
+    return [item["subject"] for item in records[:limit]]
 
 
 def now_iso() -> str:
@@ -447,6 +469,16 @@ class DialogMemory:
                 _time(r["received_at"])
                 if r["received_at_source"] not in ("imap_internaldate", "observed_at") or not isinstance(r["user_summary"], str) or not r["user_summary"].strip():
                     raise MemoryError("记忆的用户梗概或接收时间来源无效。")
+            if "subject" in r:
+                try:
+                    validate_subject(r["subject"])
+                except ValueError as exc:
+                    raise MemoryError("对话主题字段无效。") from exc
+            if "image_observations" in r:
+                try:
+                    validate_observations(r["image_observations"])
+                except VisionError as exc:
+                    raise MemoryError("对话图片观察字段无效。") from exc
             if r["status"] == "sent":
                 _time(r["sent_at"])
             elif r["sent_at"] is not None:
@@ -543,6 +575,10 @@ class DialogMemory:
             )}
             entry["initiated_by"] = "assistant" if record["type"] == "deepseek自己主动发送" else "user"
             entry.update({k: record[k] for k in _RELATION_FIELDS if k in record})
+            if "image_observations" in record:
+                entry["image_observations"] = record["image_observations"]
+            if "subject" in record:
+                entry["subject"] = record["subject"]
             history.append(entry)
         state = conversation_state(
             snapshot["dialogs"], mode=mode, current_message=current_message,
@@ -614,7 +650,8 @@ def load_story_extraction_prompt(path: str | Path = PROMPT_PATH) -> str | None:
 
 def summarize(bot, prompt: str, user_body: str | None, assistant_body: str, *, secrets=(),
               story_context=None, extraction_prompt=None, history=None, anchors=None,
-              validation_feedback=None) -> dict:
+              validation_feedback=None, user_evidence=None, generate_subject=False,
+              recent_subjects=()) -> dict:
     enabled = story_context is not None
     if enabled and (not isinstance(extraction_prompt, str) or not extraction_prompt.strip()):
         raise MemoryError("联合提取需要非空故事提取提示词。")
@@ -622,7 +659,8 @@ def summarize(bot, prompt: str, user_body: str | None, assistant_body: str, *, s
         try:
             validate_updates({"event_updates": [], "memory_updates": []},
                              story_context=story_context, user_body=user_body,
-                             assistant_body=assistant_body, anchors=anchors, secrets=secrets)
+                             assistant_body=assistant_body, anchors=anchors, secrets=secrets,
+                             user_evidence=user_evidence)
         except (StoryError, StoryValidationError) as exc:
             raise MemoryError("调用方故事上下文或时间锚点无效，未调用提取模型。") from exc
     payload = {"user_email": user_body, "assistant_email": assistant_body}
@@ -636,6 +674,22 @@ def summarize(bot, prompt: str, user_body: str | None, assistant_body: str, *, s
             "只输出 user_summary、assistant_summary、event_updates、memory_updates 四个字段；"
             "前两字段沿用原梗概约束，后两字段必须是数组，没有更新时为空数组。\n"
             + extraction_prompt
+        )
+    if user_evidence is not None:
+        payload["user_evidence"] = user_evidence
+        prompt += "\n模型视觉观察不是用户原话；仅有图片依据的更新domain必须uncertain。证据只能来自原文或单一图片观察段，不拼接。"
+    if generate_subject:
+        subject_template = payload.setdefault("json_templates", {}).setdefault("output_template", {
+            "user_summary": "用户梗概" if user_body is not None else None,
+            "assistant_summary": "助手梗概",
+        })
+        subject_template["mail_subject"] = "根据本封正文填写具体自然且不重复的短主题"
+        payload["recent_subjects"] = list(recent_subjects)
+        prompt += (
+            "\n本次额外生成主动邮件主题：根JSON在前述字段之外必须再包含mail_subject。"
+            "依据assistant_email的实际内容，填写1至60字符自然中文主题，避免与recent_subjects重复。"
+            "不要固定用‘想和你聊聊’，不要Subject/主题/Re/Fwd前缀、换行或控制符；"
+            "不使用时间戳或随机字符假装多样，主题与正文一致。只返回完整根JSON。"
         )
     if validation_feedback is not None:
         payload["repair"] = validation_feedback
@@ -670,8 +724,16 @@ def summarize(bot, prompt: str, user_body: str | None, assistant_body: str, *, s
     expected = {"user_summary", "assistant_summary"}
     if enabled:
         expected |= {"event_updates", "memory_updates"}
+    if generate_subject:
+        expected.add("mail_subject")
     if not isinstance(result, dict) or set(result) != expected:
         raise invalid("模型梗概字段不符合要求。", "invalid_fields")
+    if generate_subject:
+        try:
+            result["mail_subject"] = validate_subject(result["mail_subject"], recent_subjects)
+        except ValueError:
+            raise invalid("主动主题无效或重复。", "invalid_mail_subject", "mail_subject",
+                          "依据正文换一个具体自然的1至60字单行主题，避开recent_subjects及Subject/Re等前缀。") from None
     for key in ("user_summary", "assistant_summary"):
         value = result[key]
         if key == "user_summary" and user_body is None:
@@ -691,7 +753,7 @@ def summarize(bot, prompt: str, user_body: str | None, assistant_body: str, *, s
             validated = validate_updates(
                 {"event_updates": result.pop("event_updates"), "memory_updates": result.pop("memory_updates")},
                 story_context=story_context, user_body=user_body, assistant_body=assistant_body,
-                anchors=payload["anchors"], secrets=secrets,
+                anchors=payload["anchors"], secrets=secrets, user_evidence=user_evidence,
             )
         except StoryValidationError as exc:
             raise SummaryError("事件或长期记忆更新不符合协议。", details=exc.safe_details(),
@@ -704,7 +766,8 @@ def summarize(bot, prompt: str, user_body: str | None, assistant_body: str, *, s
     return result
 
 
-def new_record(snapshot: dict, message: dict | None, summaries: dict) -> dict:
+def new_record(snapshot: dict, message: dict | None, summaries: dict, *, subject=None,
+               image_observations=None) -> dict:
     target, source = resolve_reply(snapshot["dialogs"], message)
     record = {
         "reply_to_assistant_message_id": target,
@@ -722,6 +785,10 @@ def new_record(snapshot: dict, message: dict | None, summaries: dict) -> dict:
         "uidvalidity": message.get("uidvalidity") if message else None,
         "status": "prepared",
     }
+    if subject is not None:
+        record["subject"] = validate_subject(subject)
+    if image_observations:
+        record["image_observations"] = validate_observations(image_observations)
     if "story_candidate" in summaries:
         candidate = summaries["story_candidate"]
         try:
@@ -737,6 +804,8 @@ def new_record(snapshot: dict, message: dict | None, summaries: dict) -> dict:
 
 def send_recorded(memory: DialogMemory, snapshot: dict, record: dict, mailbox, subject: str, body: str, **kwargs) -> str:
     """SMTP 只调用一次；记录未确认时由调用方停止，不能重进发信流程。"""
+    if "subject" in record and record["subject"] != subject:
+        raise MemoryError("实际发送主题与保存主题不一致，未发送。")
     memory.prepare(record, snapshot["revision"])
     memory.update(record["id"], "sending")
     try:

@@ -25,6 +25,10 @@ def load_module(name, filename):
 
 mail_logging = load_module("tested_mail_logging", "mail_logging.py")
 sys.modules["mail_logging"] = mail_logging
+mail_images = load_module("tested_mail_images", "mail_images.py")
+sys.modules["mail_images"] = mail_images
+vision = load_module("tested_vision", "vision.py")
+sys.modules["vision"] = vision
 mail = load_module("tested_mail", "mail.py")
 # 模拟整个 SDK，即使尚未安装依赖也能运行。
 sdk = ModuleType("openai")
@@ -60,8 +64,18 @@ with patch.dict(sys.modules, {"openai": sdk, "dfy_test": llm, "mail": mail, "mai
 SUMMARY = json.dumps({"user_summary": "用户提出问题。", "assistant_summary": "助手给出回答。"}, ensure_ascii=False)
 
 
+def mock_summary(question):
+    request = json.loads(question)
+    result = json.loads(SUMMARY)
+    if request["user_email"] is None:
+        result["user_summary"] = None
+    if "mail_subject" in request.get("json_templates", {}).get("output_template", {}):
+        result["mail_subject"] = "一起聊聊今天的新发现"
+    return json.dumps(result, ensure_ascii=False)
+
+
 def mock_answer(question, **kwargs):
-    return SUMMARY if kwargs.get("json_mode") else "回答"
+    return mock_summary(question) if kwargs.get("json_mode") else "回答"
 
 
 def mock_send(*args, **kwargs):
@@ -74,6 +88,10 @@ def message(uid, identifier=None, body="问题"):
         "message_id": identifier if identifier is not None else f"<m{uid}@example.com>",
         "subject": "提问", "references": "<old@example.com>", "body": body,
     }
+
+
+def fetch_size(raw):
+    return "OK", [f"1 (RFC822.SIZE {len(raw)})".encode("ascii")]
 
 
 def raw_email(uid, sender="User <user@example.com>", headers=None):
@@ -154,11 +172,13 @@ class MailTests(unittest.TestCase):
         self.connection.uid.side_effect = [
             ("OK", [b"50 100 101"]),
             ("OK", [b"100 101"]),
+            fetch_size(raw_email(101)),
             ("OK", [(b"body", raw_email(101))]),
         ]
         cursor, messages = self.client.read_user_emails_since((10, 100))
         self.assertEqual(cursor, (10, 101))
         self.assertEqual([item["uid"] for item in messages], ["101"])
+        self.assertEqual(self.connection.uid.call_count, 4)
 
     def test_status_rejected_still_uses_search(self):
         self.state["UIDNEXT"] = None
@@ -186,11 +206,13 @@ class MailTests(unittest.TestCase):
         self.state["UIDNEXT"] = None
         self.connection.status.return_value = ("OK", [b'INBOX (UIDVALIDITY 10 UIDNEXT 102)'])
         self.connection.uid.side_effect = [
-            ("OK", [b"101"]), ("OK", [(b"body", raw_email(101))]),
+            ("OK", [b"101"]), fetch_size(raw_email(101)),
+            ("OK", [(b"body", raw_email(101))]),
         ]
         cursor, messages = self.client.read_user_emails_since((10, 100))
         self.assertEqual(cursor, (10, 101))
         self.assertEqual([item["uid"] for item in messages], ["101"])
+        self.assertEqual(self.connection.uid.call_count, 3)
 
     def test_many_messages_and_old_uid_exclusion(self):
         self.state["UIDNEXT"] = b"162"
@@ -199,12 +221,16 @@ class MailTests(unittest.TestCase):
             if name == "search":
                 self.assertEqual(args, (None, "UID", "101:161", "FROM", '"user@example.com"'))
                 return "OK", [b"99 " + b" ".join(str(i).encode() for i in reversed(range(101, 162)))]
+            raw = raw_email(int(args[0]))
+            if args[1] == "(RFC822.SIZE)":
+                return fetch_size(raw)
             self.assertEqual(args[1], "(INTERNALDATE BODY.PEEK[])")
-            return "OK", [(b"body", raw_email(int(args[0]))), b")"]
+            return "OK", [(b"body", raw), b")"]
         self.connection.uid.side_effect = command
         cursor, messages = self.client.read_user_emails_since((10, 100))
         self.assertEqual(cursor, (10, 161))
         self.assertEqual([int(m["uid"]) for m in messages], list(range(101, 162)))
+        self.assertEqual(self.connection.uid.call_count, 1 + 2 * 61)
 
     def test_automatic_and_sender_filter(self):
         for headers in [
@@ -287,6 +313,7 @@ class MailTests(unittest.TestCase):
         self.state["UIDNEXT"] = b"102"
         self.connection.uid.side_effect = [
             ("OK", [b"101"]),
+            fetch_size(raw_email(101, headers={"Auto-Submitted": "auto-generated"})),
             ("OK", [(b"body", raw_email(101, headers={"Auto-Submitted": "auto-generated"}))]),
         ]
         self.assertEqual(self.client.read_user_emails_since((10, 100)), ((10, 101), []))
@@ -618,7 +645,7 @@ class LoggingTests(unittest.TestCase):
             box, bot = MagicMock(), MagicMock()
             box.get_mailbox_cursor.return_value = (10, 0)
             box.read_user_emails_since.return_value = ((10, 1), [message(1, body="PRIVATE BODY")])
-            bot.ask.side_effect = lambda question, **kw: SUMMARY if kw.get("json_mode") else "PRIVATE ANSWER"
+            bot.ask.side_effect = lambda question, **kw: mock_summary(question) if kw.get("json_mode") else "PRIVATE ANSWER"
             box.send_email.side_effect = mock_send
             listener = receive.MailReceiver(box, bot, "PRIVATE PROMPT", memory_path=Path(tmp) / "dialog.json", summary_prompt="JSON summary")
             listener.start()

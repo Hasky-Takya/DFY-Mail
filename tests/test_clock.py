@@ -10,8 +10,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from test_receive import (
-    SUMMARY, llm, load_module, mail, mail_logging, memory_module, message,
-    mock_send, receive, sdk,
+    llm, load_module, mail, mail_logging, memory_module, message,
+    mock_send, mock_summary, receive, sdk,
 )
 import sys
 
@@ -40,7 +40,10 @@ class ClockTests(unittest.TestCase):
             if not kwargs.get("json_mode"):
                 return "PRIVATE ANSWER"
             data = json.loads(question)
-            return json.dumps({"user_summary": None if data["user_email"] is None else "用户提问。", "assistant_summary": "助手回答。"}, ensure_ascii=False)
+            result = {"user_summary": None if data["user_email"] is None else "用户提问。", "assistant_summary": "助手回答。"}
+            if "mail_subject" in data.get("json_templates", {}).get("output_template", {}):
+                result["mail_subject"] = "一起聊聊今天的新发现"
+            return json.dumps(result, ensure_ascii=False)
         self.bot.ask.side_effect = answer
         self.receiver = receive.MailReceiver(
             self.box, self.bot, "PRIVATE REPLY", memory_path=self.path / "dialog.json",
@@ -77,6 +80,8 @@ class ClockTests(unittest.TestCase):
         self.advance(1)
         self.scheduler.tick()
         self.box.send_email.assert_called_once()
+        self.assertEqual(self.box.send_email.call_args.args[0], "一起聊聊今天的新发现")
+        self.assertNotEqual(self.box.send_email.call_args.args[0], self.prompts["subject"])
         self.assertEqual(self.rng.call_count, 2)
         self.assertEqual(self.scheduler.deadline, self.mono + 3600)
         dialogs = self.receiver.memory.snapshot()["dialogs"]
@@ -146,7 +151,7 @@ class ClockTests(unittest.TestCase):
         self.box.read_user_emails_since.return_value = ((10, 1), [incoming])
         def answer(question, **kwargs):
             self.advance(30)
-            return SUMMARY if kwargs.get("json_mode") else "PRIVATE ANSWER"
+            return mock_summary(question) if kwargs.get("json_mode") else "PRIVATE ANSWER"
         self.bot.ask.side_effect = answer
         expected = self.mono + 3600
         self.scheduler.tick()
@@ -257,7 +262,7 @@ class ClockTests(unittest.TestCase):
 
     def test_summary_retry_reuses_body(self):
         self.due()
-        self.bot.ask.side_effect = ["PRIVATE ANSWER", "invalid json", json.dumps({"user_summary": None, "assistant_summary": "助手回答。"})]
+        self.bot.ask.side_effect = ["PRIVATE ANSWER", "invalid json", json.dumps({"user_summary": None, "assistant_summary": "助手回答。", "mail_subject": "一起聊聊今天的新发现"})]
         self.scheduler.tick()
         self.box.send_email.assert_not_called()
         self.scheduler.tick()

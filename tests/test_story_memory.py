@@ -17,6 +17,11 @@ SPEC.loader.exec_module(story)
 AT = "2026-10-25T08:00:00+08:00"
 LATER = "2026-10-26T08:00:00+08:00"
 BODY = "We planned tomorrow's walk. I prefer quiet places. secret-credential"
+USER_EVIDENCE = {"text": "Original typed note.", "images": [
+    {"image_id": "image-1", "text": "A blue invitation says Friday. secret-credential"},
+    {"image_id": "image-2", "text": "A green receipt says Monday."},
+]}
+CANONICAL_BODY = USER_EVIDENCE["text"] + "\n" + "\n".join(image["text"] for image in USER_EVIDENCE["images"])
 
 
 def event(**changes):
@@ -269,6 +274,107 @@ class StoryTests(unittest.TestCase):
             validate(raw([event(evidence="PLANNED tomorrow's walk")]))
         validate(raw([event(source="llm")]), user_body=None)
 
+    def test_image_evidence_is_program_derived_and_does_not_mutate_inputs(self):
+        ev = event(domain="uncertain", evidence="blue invitation", event_time={"raw": "Friday", "start": None, "end": None})
+        mem = memory(domain="uncertain", evidence="green receipt")
+        value, metadata = raw([ev], [mem]), copy.deepcopy(USER_EVIDENCE)
+        original = copy.deepcopy(value)
+        validated = validate(value, user_body=CANONICAL_BODY, user_evidence=metadata)
+        self.assertEqual(value, original)
+        self.assertEqual(metadata, USER_EVIDENCE)
+        for key, image_id in (("event_updates", "image-1"), ("memory_updates", "image-2")):
+            self.assertEqual(validated[key][0]["_validated_source"], {
+                "evidence_origin": "image_observation", "image_ids": [image_id]})
+        pkg = story.materialize_updates(validated, dialog_id="visual", story_context=story.empty_context(),
+                                        observed_at=AT, user_message_id=None,
+                                        assistant_message_id="<assistant@example.test>")
+        self.assertNotIn("_validated_source", json.dumps(pkg))
+        for key, image_id in (("event_updates", "image-1"), ("memory_updates", "image-2")):
+            self.assertEqual(pkg[key][0]["source_refs"][-1], {
+                "dialog_id": "visual", "message_id": None, "source": "user", "time": AT,
+                "quote": validated[key][0]["evidence"],
+                "evidence_origin": "image_observation", "image_ids": [image_id]})
+
+    def test_metadata_prefers_original_text_and_leaves_legacy_or_llm_unchanged(self):
+        metadata = {"text": BODY, "images": [{"image_id": "image-1", "text": BODY}]}
+        original = raw([event()], [memory()])
+        self.assertEqual(validate(original, user_evidence=metadata), validate(original))
+        self.assertEqual(validate(raw([event(source="llm")]), user_evidence=USER_EVIDENCE),
+                         validate(raw([event(source="llm")])))
+        # Metadata is authoritative even when the canonical body includes a quote.
+        self.assert_validation_details(raw([event()]), "evidence_not_in_source", "event_updates[0].evidence",
+                                       user_evidence=USER_EVIDENCE)
+        # Omission retains the old unrestricted-body substring contract.
+        joined = "Friday. secret-credential\nA green"
+        validate(raw(memories=[memory(evidence=joined)]), user_body=CANONICAL_BODY)
+
+    def test_image_only_domains_have_controlled_retry_hint(self):
+        for domain in story.DOMAINS - {"uncertain"}:
+            for kind in ("event", "memory"):
+                with self.subTest(domain=domain, kind=kind):
+                    value = raw([event(domain=domain, evidence="blue invitation",
+                                       event_time={"raw": None, "start": None, "end": None})]) if kind == "event" else raw(
+                                           memories=[memory(domain=domain, evidence="blue invitation")])
+                    self.assert_validation_details(value, "image_requires_uncertain",
+                                                   f"{kind}_updates[0].domain", user_body=CANONICAL_BODY,
+                                                   user_evidence=USER_EVIDENCE)
+
+    def test_cross_fragment_evidence_and_raw_time_are_rejected(self):
+        for quote in ("Friday. secret-credential\nA green", "note.\nA blue"):
+            self.assert_validation_details(raw(memories=[memory(domain="uncertain", evidence=quote)]),
+                                           "evidence_not_in_source", "memory_updates[0].evidence",
+                                           user_body=CANONICAL_BODY, user_evidence=USER_EVIDENCE)
+        for quote, raw_time in (("blue invitation", "Monday"), ("Original typed", "Friday")):
+            self.assert_validation_details(raw([event(domain="uncertain", evidence=quote,
+                                                      event_time={"raw": raw_time, "start": None, "end": None})]),
+                                           "raw_time_not_in_source", "event_updates[0].event_time.raw",
+                                           user_body=CANONICAL_BODY, user_evidence=USER_EVIDENCE)
+        # A duplicate image quote still has one deterministic source: first match.
+        metadata = {"text": "", "images": [{"image_id": "image-1", "text": "invitation"},
+                                              {"image_id": "image-2", "text": "invitation Monday"}]}
+        self.assert_validation_details(raw([event(domain="uncertain", evidence="invitation",
+                                                  event_time={"raw": "Monday", "start": None, "end": None})]),
+                                       "raw_time_not_in_source", "event_updates[0].event_time.raw",
+                                       user_evidence=metadata)
+
+    def test_model_cannot_supply_provenance_even_with_metadata(self):
+        for key, value in (("_validated_source", {"evidence_origin": "image_observation", "image_ids": ["image-1"]}),
+                           ("evidence_origin", "image_observation"), ("image_ids", ["image-1"]),
+                           ("source_refs", [])):
+            for kwargs in ({}, {"user_evidence": USER_EVIDENCE}):
+                with self.subTest(key=key, kwargs=kwargs):
+                    self.assert_validation_details(raw([event(**{key: value})]), "invalid_fields",
+                                                   "event_updates[0]", **kwargs)
+
+    def test_program_evidence_schema_and_safe_paths_are_bounded(self):
+        marker = "PRIVATE_METADATA_VALUE"
+        values = [[], {}, {"text": None, "images": []}, {"text": "", "images": {}},
+                  {"text": "", "images": [{"image_id": marker, "text": marker}]},
+                  {"text": "", "images": [{"image_id": "image-1", "text": None}]},
+                  {"text": "", "images": [{"image_id": "image-1", "text": ""}] * 2},
+                  {"text": "", "images": [{"image_id": "image-5", "text": ""}]},
+                  {"text": "", "images": [], marker: marker}]
+        for metadata in values:
+            with self.subTest(metadata=metadata), self.assertRaises(story.StoryValidationError) as caught:
+                validate(raw(), user_evidence=metadata)
+            self.assertNotIn(marker, json.dumps(caught.exception.safe_details()))
+            self.assertIn(caught.exception.path, {"user_evidence", "user_evidence.text", "user_evidence.images"})
+        validate(raw(), user_evidence={"text": "", "images": []})
+        with self.assertRaises(story.StoryValidationError):
+            validate(raw(), user_body=None, user_evidence=USER_EVIDENCE)
+        error = story.StoryValidationError(marker, code="image_requires_uncertain",
+                                           path="user_evidence.images[0]." + marker)
+        self.assertEqual(error.path, "$")
+        self.assertNotIn(marker, json.dumps(error.safe_details()))
+
+    def test_image_evidence_redaction_keeps_program_locator(self):
+        validated = validate(raw(memories=[memory(domain="uncertain", evidence="secret-credential")]),
+                             user_body=CANONICAL_BODY, user_evidence=USER_EVIDENCE,
+                             secrets=("secret-credential", "image-1"))
+        self.assertEqual(validated["memory_updates"][0]["evidence"], "[REDACTED]")
+        self.assertEqual(validated["memory_updates"][0]["_validated_source"]["image_ids"], ["image-1"])
+        self.assertNotIn("secret-credential", json.dumps(validated))
+
     def test_time_iso_timezone_range_and_program_anchor(self):
         validate(raw([event(event_time={"raw": "tomorrow", "start": LATER, "end": None})]),
                  anchors={"as_of": AT, "received_at": None, "received_at_source": "unknown"})
@@ -360,6 +466,109 @@ class StoryTests(unittest.TestCase):
         self.assertEqual(updated["events"][0]["source_refs"][0], ev["source_refs"][0])
         self.assertEqual(updated["events"][0]["source_refs"][1]["message_id"], "<assistant@example.test>")
         self.assertEqual(updated["memories"][0]["related_event_ids"], [ev["id"]])
+
+    def test_image_refs_persist_replay_and_extend_legacy_history_without_rewrite(self):
+        first = package()
+        old_package = copy.deepcopy(first)
+        context = self.reconcile([record(first)])
+        old_refs = copy.deepcopy(context["events"][0]["source_refs"])
+        ev, mem = context["events"][0], context["memories"][0]
+        updates = raw([event(target_id=ev["id"], domain="uncertain", evidence="blue invitation",
+                             event_time={"raw": "Friday", "start": None, "end": None})],
+                      [memory(target_id=mem["id"], domain="uncertain", evidence="green receipt")])
+        validated = validate(updates, context, user_body=CANONICAL_BODY, user_evidence=USER_EVIDENCE)
+        second = story.materialize_updates(validated, dialog_id="dialog-2", story_context=context,
+                                           observed_at=LATER, user_message_id="<user@example.test>",
+                                           assistant_message_id="<assistant@example.test>")
+        # The dialog log is also synthetic and persists the frozen record package.
+        log = self.directory / "dialog.json"
+        records = [record(first), record(second)]
+        log.write_text(json.dumps({"dialogs": records}), encoding="utf-8")
+        final = story.reconcile_locked(json.loads(log.read_text(encoding="utf-8")), self.directory)
+        self.assertEqual(first, old_package)
+        for kind, image_id in (("events", "image-1"), ("memories", "image-2")):
+            item = final[kind][0]
+            self.assertEqual(item["version"], 2)
+            self.assertEqual(item["source_refs"][0], context[kind][0]["source_refs"][0])
+            self.assertEqual(len(item["source_refs"][0]), 5)
+            self.assertEqual(item["source_refs"][-1]["image_ids"], [image_id])
+            self.assertEqual(item["source_refs"][-1]["evidence_origin"], "image_observation")
+        self.assertEqual(final["events"][0]["source_refs"][:-1], old_refs)
+        before = {path: path.read_bytes() for path in self.directory.iterdir()}
+        with patch.object(story.os, "replace", side_effect=AssertionError("idempotent replay must not write")):
+            self.assertEqual(story.reconcile_locked(json.loads(log.read_text(encoding="utf-8")), self.directory), final)
+        self.assertEqual({path: path.read_bytes() for path in self.directory.iterdir()}, before)
+        # A later typed correction may use a normal domain, retaining image history.
+        third = package(raw([event(target_id=ev["id"])]), final, "dialog-3", LATER)
+        latest = self.reconcile(records + [record(third)])
+        self.assertEqual(latest["events"][0]["source_refs"][:-1], final["events"][0]["source_refs"])
+        self.assertEqual(len(latest["events"][0]["source_refs"][-1]), 5)
+        # Image history is immutable, even when a forged old locator is structurally valid.
+        forged = copy.deepcopy(third)
+        forged["event_updates"][0]["source_refs"][1]["image_ids"] = ["image-4"]
+        originals = {path: path.read_bytes() for path in self.directory.iterdir()}
+        with self.assertRaises(story.StoryError):
+            self.reconcile(records + [record(forged)])
+        self.assertEqual({path: path.read_bytes() for path in self.directory.iterdir()}, originals)
+
+    def test_image_reference_optional_pair_schema_user_only_and_uncertain(self):
+        original = package(raw([event(domain="uncertain")], [memory(domain="uncertain")]))
+        image_meta = {"evidence_origin": "image_observation", "image_ids": ["image-4"]}
+        for key in ("event_updates", "memory_updates"):
+            valid = copy.deepcopy(original)
+            valid[key][0]["source_refs"][-1].update(image_meta)
+            self.assertIs(story.validate_package(valid), valid)
+            invalid = [
+                {"evidence_origin": "image_observation"}, {"image_ids": ["image-1"]},
+                {"evidence_origin": "typed", "image_ids": ["image-1"]},
+                {"evidence_origin": "image_observation", "image_ids": []},
+                {"evidence_origin": "image_observation", "image_ids": "image-1"},
+                {"evidence_origin": "image_observation", "image_ids": [None]},
+                {"evidence_origin": "image_observation", "image_ids": ["image-0"]},
+                {"evidence_origin": "image_observation", "image_ids": ["image-5"]},
+                {"evidence_origin": "image_observation", "image_ids": ["image-01"]},
+                {"evidence_origin": "image_observation", "image_ids": ["image-1", "image-2"]},
+                {**image_meta, "extra": "PRIVATE"},
+            ]
+            for provenance in invalid:
+                bad = copy.deepcopy(original)
+                bad[key][0]["source_refs"][-1].update(provenance)
+                with self.subTest(key=key, provenance=provenance), self.assertRaises(story.StoryValidationError):
+                    story.validate_package(bad)
+            bad = copy.deepcopy(valid)
+            bad[key][0]["domain"] = "shared_story"
+            with self.assertRaises(story.StoryValidationError) as caught:
+                story.validate_package(bad)
+            self.assertEqual(caught.exception.code, "image_requires_uncertain")
+            bad = copy.deepcopy(valid)
+            bad[key][0]["source"] = "llm"
+            bad[key][0]["source_refs"][-1].update(source="llm", message_id="<assistant@example.test>")
+            if key == "event_updates":
+                bad[key][0]["origin"] = "llm"
+            with self.assertRaises(story.StoryValidationError):
+                story.validate_package(bad)
+
+    def test_image_projection_tampering_and_private_materialization_shape_rejected(self):
+        validated = validate(raw(memories=[memory(domain="uncertain", evidence="blue invitation")]),
+                             user_body=CANONICAL_BODY, user_evidence=USER_EVIDENCE)
+        pkg = story.materialize_updates(validated, dialog_id="visual", story_context=story.empty_context(),
+                                        observed_at=AT, user_message_id="<user@example.test>",
+                                        assistant_message_id="<assistant@example.test>")
+        self.reconcile([record(pkg)])
+        projected = self.disk("memory.json")
+        projected["memories"][0]["source_refs"][-1]["image_ids"] = ["image-2"]
+        (self.directory / "memory.json").write_text(json.dumps(projected), encoding="utf-8")
+        before = {path: path.read_bytes() for path in self.directory.iterdir()}
+        with self.assertRaises(story.StoryError):
+            self.reconcile([record(pkg)])
+        self.assertEqual({path: path.read_bytes() for path in self.directory.iterdir()}, before)
+        for provenance in (None, {}, {"evidence_origin": "typed", "image_ids": ["image-1"]}):
+            bad = copy.deepcopy(validated)
+            bad["memory_updates"][0]["_validated_source"] = provenance
+            with self.assertRaises(story.StoryValidationError):
+                story.materialize_updates(bad, dialog_id="visual", story_context=story.empty_context(),
+                                          observed_at=AT, user_message_id="<user@example.test>",
+                                          assistant_message_id="<assistant@example.test>")
 
     def test_source_trace_cannot_change_origin_repeat_dialog_or_drop_llm_message_id(self):
         first = package()
