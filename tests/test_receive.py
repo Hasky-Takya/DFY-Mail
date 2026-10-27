@@ -55,6 +55,13 @@ with patch.dict(sys.modules, {"openai": sdk}):
     llm = load_module("tested_llm", "dfy_test.py")
 story_module = load_module("tested_story_memory", "story_memory.py")
 sys.modules["story_memory"] = story_module
+context_selection = load_module("tested_context_selection", "context_selection.py")
+sys.modules["context_selection"] = context_selection
+task_store = load_module("tested_task_store", "task_store.py")
+sys.modules["task_store"] = task_store
+with patch.dict(sys.modules, {"openai": sdk}):
+    retry_policy = load_module("tested_retry_policy", "retry_policy.py")
+sys.modules["retry_policy"] = retry_policy
 memory_module = load_module("tested_dialog_memory", "dialog_memory.py")
 with patch.dict(sys.modules, {"openai": sdk, "dfy_test": llm, "mail": mail, "mail_logging": mail_logging, "dialog_memory": memory_module}):
     receive = load_module("tested_receive", "dfy_receive.py")
@@ -403,13 +410,14 @@ class ReceiverTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.memory_path = Path(self.tmp.name) / "dialog.json"
+        self.now = 1000.0
         self.bot.ask.side_effect = mock_answer
         self.box.send_email.side_effect = mock_send
         self.listener = self.make_listener(self.box, self.bot, "回复指令")
         self.listener.start()
 
     def make_listener(self, box, bot, prompt):
-        return receive.MailReceiver(box, bot, prompt, memory_path=self.memory_path, summary_prompt="输出 JSON 梗概")
+        return receive.MailReceiver(box, bot, prompt, memory_path=self.memory_path, summary_prompt="输出 JSON 梗概", clock=lambda: self.now)
 
     def test_actual_body_reaches_sdk_and_generated_answer_is_sent(self):
         original = EmailMessage()
@@ -506,21 +514,43 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(self.box.send_email.call_count, 1)
         self.assertEqual(len(self.listener.pending), 1)
         self.listener.poll_once()
+        # A deferred task must not block a later new message.
+        self.assertEqual(self.box.send_email.call_count, 2)
+        self.assertEqual(len(self.listener.pending), 1)
+        self.assertEqual(self.listener.pending[0]["message"]["uid"], "2")
+        self.box.read_user_emails_since.side_effect = None
+        self.box.read_user_emails_since.return_value = ((10, 3), [])
+        self.now += 2
+        self.listener.poll_once()
         self.assertEqual(self.box.send_email.call_count, 3)
         self.assertFalse(self.listener.pending)
+        self.assertEqual(self.bot.ask.call_count, 7)
 
-    def test_api_permanent_and_retry_limit(self):
+    def test_api_permanent_pauses_without_retry(self):
         self.box.read_user_emails_since.return_value = ((10, 1), [message(1)])
         self.bot.ask.side_effect = APIStatusError(401)
-        with self.assertRaises(RuntimeError):
-            self.listener.poll_once()
+        self.listener.poll_once()
+        self.assertEqual(self.listener.store.get_control("service:api:paused"), "api_auth_access_failed")
+        self.assertEqual(len(self.listener.pending), 1)
+        self.listener.poll_once()
+        self.bot.ask.assert_called_once()
         self.box.send_email.assert_not_called()
+
+    def test_api_network_retries_indefinitely_with_capped_backoff(self):
+        self.box.read_user_emails_since.return_value = ((10, 1), [message(1)])
         self.bot.ask.side_effect = APIConnectionError()
-        self.listener.pending[0]["attempts"] = 0
-        self.listener.poll_once()
-        self.listener.poll_once()
-        with self.assertRaises(RuntimeError):
+        for count, delay in enumerate((2, 4, 8, 16, 32, 64, 128, 256, 256, 256), 1):
             self.listener.poll_once()
+            self.assertEqual(self.bot.ask.call_count, count)
+            task = self.listener.pending[0]
+            row = self.listener.store.get(task["task_id"])
+            self.assertEqual(row["status"], "retry")
+            self.assertEqual(row["next_attempt_at"], self.now + delay)
+            self.listener.poll_once()
+            self.assertEqual(self.bot.ask.call_count, count)
+            self.now += delay
+        self.assertFalse(self.listener.store.list_tasks(statuses=("quarantined",), kind="reply"))
+        self.box.send_email.assert_not_called()
 
     def test_missing_prompt_rejected_and_default_path(self):
         self.assertEqual(receive.PROMPT_PATH, SRC.parent / "config" / "prompt.json")
@@ -528,10 +558,14 @@ class ReceiverTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 receive.load_reply_prompt()
 
-    def test_mailbox_state_error_propagates(self):
+    def test_mailbox_state_error_pauses_without_advancing_cursor(self):
         self.box.read_user_emails_since.side_effect = mail.MailboxStateError("changed")
-        with self.assertRaises(mail.MailboxStateError):
-            self.listener.poll_once()
+        self.assertFalse(self.listener.poll_once())
+        self.assertEqual(self.listener.paused, "uid_state_invalid")
+        self.assertEqual(self.listener.store.get_control("service:imap:paused"), "uid_state_invalid")
+        self.assertEqual(self.listener.cursor, (10, 0))
+        self.assertFalse(self.listener.poll_once())
+        self.box.read_user_emails_since.assert_called_once()
         self.box.send_email.assert_not_called()
 
     def test_receive_disconnect_retains_cursor(self):
@@ -551,6 +585,10 @@ class ReceiverTests(unittest.TestCase):
         ]
         with patch("builtins.print"):
             self.listener.poll_once()
+            self.listener.poll_once()
+            self.box.read_user_emails_since.assert_called_once()
+            self.assertEqual(self.listener.sync_retry_at, self.now + 2)
+            self.now += 2
             self.listener.poll_once()
         self.assertEqual(self.box.get_mailbox_cursor.call_count, 1)
         self.assertEqual([call.args[0] for call in self.box.read_user_emails_since.call_args_list], [(10, 0), (10, 0)])
@@ -577,22 +615,34 @@ class ReceiverTests(unittest.TestCase):
     def test_smtp_exception_stops_without_retry(self):
         self.box.read_user_emails_since.return_value = ((10, 1), [message(1)])
         self.box.send_email.side_effect = mail.smtplib.SMTPServerDisconnected("fake")
-        with self.assertRaisesRegex(RuntimeError, "不确定"):
-            self.listener.poll_once()
+        self.assertFalse(self.listener.poll_once())
         self.assertEqual(self.box.send_email.call_count, 1)
-        self.assertEqual(len(self.listener.pending), 1)
+        rows = self.listener.store.list_tasks(statuses=("blocked_unknown",), kind="reply")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(self.listener.blocked_reason, "send_or_projection_unconfirmed")
+        self.listener.poll_once()
+        self.now += 86400
+        self.listener.poll_once()
+        self.box.send_email.assert_called_once()
+        self.assertEqual(json.loads(self.memory_path.read_text(encoding="utf-8"))["dialogs"][0]["status"], "unknown")
+        restarted = self.make_listener(self.box, self.bot, "回复指令")
+        restarted.start()
+        self.assertEqual(restarted.blocked_reason, "memory_recovery_required")
+        self.assertFalse(restarted.poll_once())
+        self.box.send_email.assert_called_once()
+        self.assertEqual(len(restarted.store.list_tasks(statuses=("blocked_unknown",), kind="reply")), 1)
 
     def test_period_skips_missed_ticks(self):
         listener = self.make_listener(MagicMock(), MagicMock(), "reply")
         with (
-            patch.object(listener, "start"),
+            patch.object(listener, "start", side_effect=lambda: setattr(listener, 'cursor', (10, 0))),
             patch.object(listener, "poll_once", side_effect=[None, KeyboardInterrupt]),
             patch.object(receive.time, "monotonic", side_effect=[0, 0, 130, 130]),
             patch.object(receive.time, "sleep") as sleep,
         ):
             with self.assertRaises(KeyboardInterrupt):
                 listener.run(60)
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [60, 50])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [60, 60])
 
 
 class LoggingTests(unittest.TestCase):

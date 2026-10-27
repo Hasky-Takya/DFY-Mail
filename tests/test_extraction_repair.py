@@ -90,8 +90,12 @@ class ExtractionRepairTests(unittest.TestCase):
         self.bot.ask.side_effect = [ANSWER, combined(False, "BAD QUOTE", "llm", generate_subject=True), combined(False, "BAD QUOTE", "llm", generate_subject=True), combined(False, "BAD QUOTE", "llm", generate_subject=True)]
         scheduler.tick()
         scheduler.tick()
-        with self.assertRaises(RuntimeError):
-            scheduler.tick()
+        scheduler.tick()
+        rows = listener.store.list_tasks(statuses=("quarantined",), kind="proactive")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["payload"]["invalid_failures"], 3)
+        self.assertEqual(rows[0]["payload"]["body"], ANSWER)
+        self.assertIsNone(scheduler.draft)
         self.assertEqual(self.bot.ask.call_count, 4)
         self.assertIn("repair", json.loads(self.bot.ask.call_args_list[2].args[0]))
         self.box.send_email.assert_not_called()

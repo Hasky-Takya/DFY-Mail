@@ -47,7 +47,7 @@ class ClockTests(unittest.TestCase):
         self.bot.ask.side_effect = answer
         self.receiver = receive.MailReceiver(
             self.box, self.bot, "PRIVATE REPLY", memory_path=self.path / "dialog.json",
-            summary_prompt="PRIVATE SUMMARY PROMPT",
+            summary_prompt="PRIVATE SUMMARY PROMPT", clock=lambda: self.wall.timestamp(),
         )
         self.rng = MagicMock(return_value=60)
         self.prompts = {"system_prompt": "PRIVATE PERSONA", "task": "PRIVATE TOPIC", "subject": "PRIVATE SUBJECT", "summary_prompt": "PRIVATE SUMMARY PROMPT"}
@@ -185,12 +185,20 @@ class ClockTests(unittest.TestCase):
         self.bot.ask.assert_not_called()
         self.box.send_email.assert_not_called()
 
-    def test_final_check_failure_discards_draft(self):
+    def test_final_check_failure_defers_draft_until_successful_recheck(self):
         self.due()
         self.box.read_user_emails_since.side_effect = [((10, 0), []), mail.imaplib.IMAP4.abort("PRIVATE ERROR")]
         self.scheduler.tick()
         self.box.send_email.assert_not_called()
-        self.assertIsNone(self.scheduler.draft)
+        task_id = self.scheduler.draft["task_id"]
+        self.assertEqual(self.receiver.store.get(task_id)["payload"]["body"], "PRIVATE ANSWER")
+        self.scheduler.tick()
+        self.box.send_email.assert_not_called()
+        self.box.read_user_emails_since.side_effect = None
+        self.advance(2)
+        self.scheduler.tick()
+        self.box.send_email.assert_called_once()
+        self.assertEqual(self.receiver.store.get(task_id)["status"], "done")
 
     def test_pending_blocks_proactive_even_after_successful_imap(self):
         self.due()
@@ -216,7 +224,9 @@ class ClockTests(unittest.TestCase):
         self.scheduler.start()
         incoming = message(1)
         incoming.update(received_at=self.wall.isoformat(), received_at_source="imap_internaldate")
-        self.receiver.pending.append({"message": incoming, "attempts": 0})
+        self.receiver.store.ingest(self.receiver.account, (10, 1), [incoming])
+        self.receiver.cursor = (10, 1)
+        self.receiver._load_pending()
         self.box.read_user_emails_since.side_effect = mail.imaplib.IMAP4.abort("PRIVATE ERROR")
         self.assertFalse(self.receiver.poll_once())
         self.assertFalse(self.receiver.pending)
@@ -237,27 +247,40 @@ class ClockTests(unittest.TestCase):
         self.scheduler.tick()
         self.assertEqual(self.box.send_email.call_args.args[1], "PRIVATE ANSWER")
 
-    def test_generation_retries_three_times_then_stops(self):
+    def test_generation_network_retries_indefinitely_with_capped_backoff(self):
         self.due()
         self.bot.ask.side_effect = clock.APIConnectionError()
-        self.scheduler.tick()
-        self.scheduler.tick()
-        with self.assertRaises(RuntimeError):
+        for count, delay in enumerate((2, 4, 8, 16, 32, 64, 128, 256, 256, 256), 1):
             self.scheduler.tick()
-        self.assertEqual(self.bot.ask.call_count, 3)
+            self.assertEqual(self.bot.ask.call_count, count)
+            row = self.receiver.store.get(self.scheduler.draft["task_id"])
+            self.assertEqual(row["status"], "retry")
+            self.assertEqual(row["next_attempt_at"], self.wall.timestamp() + delay)
+            self.scheduler.tick()
+            self.assertEqual(self.bot.ask.call_count, count)
+            self.advance(delay)
+        self.assertFalse(self.receiver.store.list_tasks(statuses=("quarantined",), kind="proactive"))
         self.box.send_email.assert_not_called()
 
-    def test_imap_failure_does_not_reset_generation_retry_limit(self):
+    def test_imap_failure_does_not_reset_generation_backoff(self):
         self.due()
         self.bot.ask.side_effect = clock.APIConnectionError()
         self.scheduler.tick()
+        task_id = self.scheduler.draft["task_id"]
+        self.advance(2)
         self.scheduler.tick()
         self.box.read_user_emails_since.side_effect = mail.imaplib.IMAP4.abort("PRIVATE ERROR")
         self.scheduler.tick()
         self.box.read_user_emails_since.side_effect = None
-        with self.assertRaises(RuntimeError):
-            self.scheduler.tick()
+        self.advance(2)
+        self.scheduler.tick()
+        self.assertEqual(self.bot.ask.call_count, 2)
+        self.advance(2)
+        self.scheduler.tick()
         self.assertEqual(self.bot.ask.call_count, 3)
+        self.assertEqual(self.scheduler.draft["task_id"], task_id)
+        self.assertEqual(self.scheduler.draft["network_failures"], 3)
+        self.assertEqual(self.scheduler.draft["next_attempt_at"], self.wall.timestamp() + 8)
         self.box.send_email.assert_not_called()
 
     def test_summary_retry_reuses_body(self):
@@ -270,13 +293,20 @@ class ClockTests(unittest.TestCase):
         self.assertTrue(self.bot.ask.call_args_list[2].kwargs["json_mode"])
         self.box.send_email.assert_called_once()
 
-    def test_summary_stops_after_three_attempts(self):
+    def test_summary_quarantines_after_three_attempts(self):
         self.due()
         self.bot.ask.side_effect = ["BODY", "bad", "bad", "bad"]
         self.scheduler.tick()
         self.scheduler.tick()
-        with self.assertRaises(RuntimeError):
-            self.scheduler.tick()
+        self.scheduler.tick()
+        self.assertEqual(self.bot.ask.call_count, 4)
+        rows = self.receiver.store.list_tasks(statuses=("quarantined",), kind="proactive")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["payload"]["body"], "BODY")
+        self.assertEqual(rows[0]["payload"]["invalid_failures"], 3)
+        self.assertIsNone(self.scheduler.draft)
+        self.assertGreater(self.scheduler.deadline, self.mono)
+        self.scheduler.tick()
         self.assertEqual(self.bot.ask.call_count, 4)
         self.box.send_email.assert_not_called()
 
@@ -288,26 +318,34 @@ class ClockTests(unittest.TestCase):
         self.box.read_user_emails_since.side_effect = mail.imaplib.IMAP4.abort("PRIVATE ERROR")
         self.scheduler.tick()
         self.box.read_user_emails_since.side_effect = None
-        with self.assertRaises(RuntimeError):
-            self.scheduler.tick()
-        self.assertEqual(self.scheduler.failures["summary"], 3)
+        self.advance(2)
+        self.scheduler.tick()
+        rows = self.receiver.store.list_tasks(statuses=("quarantined",), kind="proactive")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["payload"]["invalid_failures"], 3)
+        self.assertEqual(rows[0]["payload"]["body"], "BODY")
+        self.assertEqual(self.bot.ask.call_count, 4)
         self.box.send_email.assert_not_called()
 
     def test_permanent_api_error_does_not_retry(self):
         self.due()
         self.bot.ask.side_effect = clock.APIStatusError(401)
-        with self.assertRaises(RuntimeError):
-            self.scheduler.tick()
-        self.assertTrue(self.scheduler.stopped)
+        self.scheduler.tick()
+        self.assertEqual(self.receiver.store.get_control("service:api:paused"), "api_auth_access_failed")
+        self.scheduler.tick()
         self.bot.ask.assert_called_once()
+        self.box.send_email.assert_not_called()
 
     def test_send_uncertainty_stops_no_retry(self):
         self.due()
         self.box.send_email.side_effect = OSError("PRIVATE BODY")
-        with self.assertRaises(memory_module.MemoryError):
-            self.scheduler.tick()
-        with self.assertRaises(memory_module.MemoryError):
-            self.scheduler.tick()
+        self.scheduler.tick()
+        self.assertTrue(self.scheduler.stopped)
+        rows = self.receiver.store.list_tasks(statuses=("blocked_unknown",), kind="proactive")
+        self.assertEqual(len(rows), 1)
+        self.scheduler.tick()
+        self.advance(24 * 3600)
+        self.scheduler.tick()
         self.box.send_email.assert_called_once()
         data = json.loads((self.path / "dialog.json").read_text(encoding="utf-8"))
         self.assertEqual(data["dialogs"][0]["status"], "unknown")
@@ -316,9 +354,10 @@ class ClockTests(unittest.TestCase):
     def test_pending_memory_stops_start(self):
         record = memory_module.new_record(self.receiver.memory.snapshot(), None, {"user_summary": None, "assistant_summary": "unconfirmed"})
         self.receiver.memory._write({"schema_version": 1, "revision": 1, "dialogs": [record]})
-        with self.assertRaises(memory_module.MemoryError):
-            self.scheduler.start()
-        self.box.latest_user_activity.assert_not_called()
+        self.scheduler.start()
+        self.assertEqual(self.receiver.blocked_reason, "memory_recovery_required")
+        self.scheduler.tick()
+        self.box.send_email.assert_not_called()
 
     def test_clock_rollback_then_user_mail_still_waits_full_interval(self):
         self.scheduler.start()
@@ -355,6 +394,7 @@ class ClockTests(unittest.TestCase):
         def start(script):
             return mail_logging.configure_logging(self.path, script=script)
         with redirect_stderr(io.StringIO()), patch.object(clock, "start_logging", side_effect=start), \
+             patch.object(clock, "SingleInstanceLock"), \
              patch.object(clock, "_load_settings", side_effect=ValueError("PRIVATE CONFIG")):
             with self.assertRaises(SystemExit) as result:
                 clock.main()
@@ -368,6 +408,7 @@ class ClockTests(unittest.TestCase):
         prompts = dict(self.prompts, reply_prompt="reply")
         with redirect_stderr(io.StringIO()), \
              patch.object(clock, "start_logging", side_effect=lambda script: mail_logging.configure_logging(self.path, script=script)), \
+             patch.object(clock, "SingleInstanceLock"), \
              patch.object(clock, "_load_settings", return_value=settings), \
              patch.object(clock, "load_clock_prompts", return_value=prompts), \
              patch.dict(clock.os.environ, {"DEEPSEEK_API_KEY": "PRIVATE KEY", "CLOCK_AUTH": "PRIVATE AUTH"}), \

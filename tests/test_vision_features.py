@@ -148,6 +148,12 @@ class VisionFeaturesTests(unittest.TestCase):
             listener = receive.MailReceiver(box, bot, "persona", memory_path=Path(directory) / "dialog.json", summary_prompt="summary", extraction_prompt="extract", on_user_message=callback)
             listener.start()
             listener.poll_once()
+            rows = listener.store.list_tasks(kind="reply")
+            self.assertEqual(len(rows), 1)
+            cached = rows[0]["payload"]
+            self.assertNotIn("images", cached["message"])
+            self.assertEqual(cached["body"], "回复图片")
+            self.assertEqual(cached["image_observations"][0]["image_id"], "image-1")
             listener.poll_once()
             callback.assert_called_once()
             self.assertEqual(sum("images" in call.kwargs for call in bot.ask.call_args_list), 1)
@@ -156,7 +162,10 @@ class VisionFeaturesTests(unittest.TestCase):
             self.assertEqual(data["dialogs"][0]["image_observations"][0]["image_id"], "image-1")
             ref = data["story_context"]["events"][0]["source_refs"][0]
             self.assertEqual(ref["evidence_origin"], "image_observation")
-            self.assertNotIn("images", incoming)
+            rows = listener.store.list_tasks(statuses=("done",), kind="reply")
+            self.assertEqual(len(rows), 1)
+            self.assertNotIn("images", rows[0]["payload"].get("message", {}))
+            self.assertNotIn("synthetic_image_payload", str(rows[0]["payload"]))
 
     def test_visual_payload_and_observations_not_in_logs(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stderr(io.StringIO()):
@@ -206,8 +215,12 @@ class VisionFeaturesTests(unittest.TestCase):
             listener.start()
             listener.poll_once()
             listener.poll_once()
-            with self.assertRaises(RuntimeError):
-                listener.poll_once()
+            listener.poll_once()
+            rows = listener.store.list_tasks(statuses=("quarantined",), kind="reply")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["payload"]["invalid_failures"], 3)
+            self.assertFalse(listener.pending)
+            listener.poll_once()
             self.assertEqual(bot.ask.call_count, 3)
             box.send_email.assert_not_called()
 

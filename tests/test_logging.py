@@ -19,6 +19,13 @@ class OutputLoggingTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.addCleanup(mail_logging.close_logging)
+        argv = patch.object(sys, "argv", ["script.py"])
+        argv.start()
+        self.addCleanup(argv.stop)
+        for module in (receive, proactive):
+            lock = patch.object(module, "SingleInstanceLock")
+            lock.start()
+            self.addCleanup(lock.stop)
         self.directory = Path(self.tmp.name)
 
     def start(self, script):

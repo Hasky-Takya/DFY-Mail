@@ -24,7 +24,8 @@ class ObservationTests(unittest.TestCase):
         self.box.send_email.side_effect = mock_send
         self.bot = MagicMock()
         self.bot.ask.side_effect = lambda question, **kwargs: mock_summary(question) if kwargs.get("json_mode") else "answer"
-        self.receiver = receive.MailReceiver(self.box, self.bot, "reply", memory_path=Path(self.tmp.name) / "dialog.json", summary_prompt="summary")
+        self.now = 1000.0
+        self.receiver = receive.MailReceiver(self.box, self.bot, "reply", memory_path=Path(self.tmp.name) / "dialog.json", summary_prompt="summary", clock=lambda: self.now)
 
     def test_current_and_batch_activities_provided_without_other_body(self):
         self.receiver.start()
@@ -124,6 +125,17 @@ class ObservationTests(unittest.TestCase):
         self.assertFalse(self.receiver.poll_once())
         self.assertFalse(self.receiver.observation["sync_ok"])
         self.assertEqual(self.receiver.observation["coverage_through"], watermark)
+        self.assertEqual(self.receiver.sync_retry_at, self.now + 2)
+        calls = self.box.read_user_emails_since.call_count
+        self.assertFalse(self.receiver.poll_once())
+        self.assertEqual(self.box.read_user_emails_since.call_count, calls)
+        self.assertFalse(self.receiver.observation["sync_ok"])
+        self.assertEqual(self.receiver.observation["coverage_through"], watermark)
+        self.box.read_user_emails_since.side_effect = None
+        self.now += 2
+        self.assertTrue(self.receiver.poll_once())
+        self.assertTrue(self.receiver.observation["sync_ok"])
+        self.assertEqual(self.receiver.sync_retry_at, 0)
 
     def test_clock_missing_historical_time_does_not_break_later_generation(self):
         now = datetime(2026, 10, 25, 12, tzinfo=timezone.utc)

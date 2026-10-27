@@ -188,9 +188,10 @@ class IntegrationTests(unittest.TestCase):
         self.box.get_mailbox_cursor.return_value = (10, 0)
         self.box.send_email.side_effect = mock_send
         self.bot.ask.side_effect = mock_answer
+        self.now = 1000.0
 
     def listener(self):
-        result = receive.MailReceiver(self.box, self.bot, "根据正文回答", memory_path=self.path, summary_prompt="JSON summary")
+        result = receive.MailReceiver(self.box, self.bot, "根据正文回答", memory_path=self.path, summary_prompt="JSON summary", clock=lambda: self.now)
         result.start()
         return result
 
@@ -240,6 +241,31 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.bot.ask.call_count, 3)
         self.box.send_email.assert_called_once()
 
+    def test_summary_network_retry_restores_cached_body_and_deadline_after_restart(self):
+        from test_receive import APIConnectionError
+        self.box.read_user_emails_since.return_value = ((10, 1), [message(1)])
+        self.bot.ask.side_effect = ["CACHED ANSWER", APIConnectionError(), SUMMARY]
+        listener = self.listener()
+        listener.poll_once()
+        task_id = listener.pending[0]["task_id"]
+        row = listener.store.get(task_id)
+        self.assertEqual(row["status"], "retry")
+        self.assertEqual(row["payload"]["body"], "CACHED ANSWER")
+        self.assertEqual(row["next_attempt_at"], self.now + 2)
+        restarted = self.listener()
+        self.assertEqual(len(restarted.pending), 1)
+        self.assertEqual(restarted.pending[0]["task_id"], task_id)
+        restarted.poll_once()
+        self.assertEqual(self.bot.ask.call_count, 2)
+        self.box.send_email.assert_not_called()
+        self.now += 2
+        restarted.poll_once()
+        self.assertEqual(self.bot.ask.call_count, 3)
+        self.assertTrue(self.bot.ask.call_args.kwargs["json_mode"])
+        self.assertEqual(self.box.send_email.call_args.args[1], "CACHED ANSWER")
+        self.box.send_email.assert_called_once()
+        self.assertEqual(restarted.store.get(task_id)["status"], "done")
+
     def test_confirmation_failure_prevents_second_poll_send(self):
         self.box.read_user_emails_since.return_value = ((10, 1), [message(1)])
         listener = self.listener()
@@ -249,10 +275,13 @@ class IntegrationTests(unittest.TestCase):
                 raise memory.MemoryError("fake disk failure")
             return original(identifier, status, **kwargs)
         with patch.object(listener.memory, "update", side_effect=update):
-            with self.assertRaisesRegex(memory.MemoryError, "SMTP 接受"):
-                listener.poll_once()
-        with self.assertRaises(memory.MemoryError):
-            listener.poll_once()
+            self.assertFalse(listener.poll_once())
+        rows = listener.store.list_tasks(statuses=("blocked_unknown",), kind="reply")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(listener.blocked_reason, "send_or_projection_unconfirmed")
+        self.assertFalse(listener.poll_once())
+        self.now += 86400
+        self.assertFalse(listener.poll_once())
         self.box.send_email.assert_called_once()
         self.assertEqual(json.loads(self.path.read_text(encoding="utf-8"))["dialogs"][0]["status"], "sending")
 
@@ -265,6 +294,10 @@ class IntegrationTests(unittest.TestCase):
         self.box.send_email.assert_not_called()
         self.assertEqual(len(listener.pending), 1)
         listener.poll_once()
+        self.bot.ask.assert_called_once()
+        self.assertEqual(listener.pending[0]["next_attempt_at"], self.now + 2)
+        self.now += 2
+        listener.poll_once()
         self.box.send_email.assert_called_once()
 
     def test_pending_model_retry_continues_during_imap_outage(self):
@@ -276,18 +309,25 @@ class IntegrationTests(unittest.TestCase):
         self.bot.ask.side_effect = [APIConnectionError(), "回答", SUMMARY]
         listener = self.listener()
         listener.poll_once()
-        listener.poll_once()
+        self.now += 2
+        self.assertFalse(listener.poll_once())
         self.box.send_email.assert_called_once()
         self.assertEqual(listener.cursor, (10, 1))
 
-    def test_bad_summary_never_sends_and_stops_after_three(self):
+    def test_bad_summary_never_sends_and_quarantines_after_three(self):
         self.box.read_user_emails_since.return_value = ((10, 1), [message(1)])
         self.bot.ask.side_effect = ["回答", "bad", "bad", "bad"]
         listener = self.listener()
         listener.poll_once()
         listener.poll_once()
-        with self.assertRaises(RuntimeError):
-            listener.poll_once()
+        listener.poll_once()
+        rows = listener.store.list_tasks(statuses=("quarantined",), kind="reply")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["payload"]["invalid_failures"], 3)
+        self.assertEqual(rows[0]["payload"]["body"], "回答")
+        self.assertFalse(listener.pending)
+        listener.poll_once()
+        self.assertEqual(self.bot.ask.call_count, 4)
         self.box.send_email.assert_not_called()
         self.assertEqual(self.store.snapshot()["dialogs"], [])
 

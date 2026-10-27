@@ -331,17 +331,26 @@ class QuestionTests(unittest.TestCase):
         self.assertNotIn("references", payload["conversation_state"]["current_event"])
         self.assertEqual((self.snapshot, event, obs), before)
 
-    def test_metadata_counts_toward_full_budget_no_silent_truncation(self):
+    def test_metadata_counts_toward_budget_and_optional_history_can_be_omitted(self):
         original = copy.deepcopy(self.snapshot)
         with self.assertRaises(memory.MemoryError):
             self.store.question(self.snapshot, "short", observed_user_activity=incoming(uid="x" * 60000), as_of=stamp(40))
         self.assertEqual(self.snapshot, original)
         text = self.store.question(self.snapshot, "short", as_of=stamp(40))
         with patch.object(memory, "CONTEXT_LIMIT", len(text)):
-            self.assertEqual(self.store.question(self.snapshot, "short", as_of=stamp(40)), text)
-        with patch.object(memory, "CONTEXT_LIMIT", len(text) - 1):
-            with self.assertRaises(memory.MemoryError):
-                self.store.question(self.snapshot, "short", as_of=stamp(40))
+            bounded = self.store.question(self.snapshot, "short", as_of=stamp(40))
+            self.assertLessEqual(len(bounded), len(text))
+        with patch.object(memory, "CONTEXT_LIMIT", len(text) - 100):
+            bounded = self.store.question(self.snapshot, "short", as_of=stamp(40))
+            self.assertLessEqual(len(bounded), len(text) - 100)
+            payload = json.loads(bounded.split("\n", 1)[1])
+            self.assertEqual(payload["history"], [])
+            self.assertEqual(payload["current"], "short")
+            self.assertEqual(payload["selection"]["dialogs"]["omitted"], 1)
+        with patch.object(memory, "CONTEXT_LIMIT", 100):
+            with self.assertRaises(memory.ContextBudgetError):
+                self.store.question(self.snapshot, "CURRENT" * 100, as_of=stamp(40))
+        self.assertEqual(self.snapshot, original)
 
 
 if __name__ == "__main__":
