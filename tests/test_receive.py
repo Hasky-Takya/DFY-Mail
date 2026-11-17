@@ -25,6 +25,8 @@ def load_module(name, filename):
 
 mail_logging = load_module("tested_mail_logging", "mail_logging.py")
 sys.modules["mail_logging"] = mail_logging
+runtime_config = load_module("tested_runtime_config", "runtime_config.py")
+sys.modules["runtime_config"] = runtime_config
 mail_images = load_module("tested_mail_images", "mail_images.py")
 sys.modules["mail_images"] = mail_images
 vision = load_module("tested_vision", "vision.py")

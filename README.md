@@ -234,6 +234,22 @@ python src/dfy_clock.py
 
 主题不合格会进入原有安全反馈修复，最多三次；不重新生成正文、不额外增加纯文字API请求，不偷偷回落固定主题。配置subject保留旧配置兼容但不再决定正常主动发送主题。普通回复的Re、In-Reply-To和References保持不变。
 
+### 2 核 2 GB 服务器与文件日志
+
+完整部署步骤见 [2核2GB部署清单](docs/deploy_2c2g.md)，统一 service 模板为 `deploy/dfy-mail.service.example`（clock 入口，同时收信和主动联系）。不要与旧service并行运行，不要把本地memory覆盖服务器最新数据。模板需按实际路径/用户调整；当前仅离线验证，尚未远程部署。
+
+`settings_example.json` 的 `logging` 节集中配置文件/控制台级别、日期与体积轮转及备份数；默认 UTF-8 INFO 日志写入 `log/output_log/dfy_clock.log`，可用 `DFY_LOG_DIR` 覆盖目录。启动会实际写入/flush探针，不能写文件即失败；运行期故障会在 stderr/journal 输出 `DFY_LOGGING_ERROR`，不能长期忽略。无TTY缺凭据会非零退出，不再等待交互输入。
+
+故事前缀核验采用流式回放，不保留全部历史context；图谱SQLite默认8MiB缓存。资源限制与本地内存测量不是目标服务器容量保证，仍须观察RSS、图片负载、磁盘和重启次数。
+
+### 单句事件与轻量知识图谱（可选）
+
+新增图谱仅是已提交故事与冻结标注的可重建投影；原 `dialog.json` 仍是发送恢复和故事更新依据。`config/settings_example.json` 的 `graph` 小节列出全部可调参数；将该节复制到实际 `settings.json`，设置 `enabled: true` 后启用。旧配置默认关闭，不会自动覆盖 `event.json`。
+
+启用后生成 `graph_store.sqlite3` 和 `event_v2.json`，包括单句事实、实体别名、人物关系/状态及事件关系。新发信的图谱候选与核心摘要共用一次模型请求，核心非法仍阻断；图谱子对象非法标记 incomplete，不写坏数据。只有 sent 记录应用图谱；新派生故障不触发重复发信。当前仅接受本轮文字证据，图片单独观察不直接生成图谱事实。
+
+完整配置、历史整理、正式切换和回滚见 [图谱使用指南](docs/event_graph.md)。迁移不会自动执行，需先停服务、备份，并在副本验证。正式切换后旧事件投影保存在 `event_legacy.json`，新 `event.json` 使用独立 schema；**不能用旧版程序直接读取新格式，也不能删除 dialog 修复图谱**。
+
 ### 长期运行、退避与隔离恢复
 
 模型请求临时错误（连接中断、超时、408/409/429/5xx）无限重传，第n次重传等待 `min(2**n,256)` 秒，即2、4、8、16、32、64、128、256秒，此后保持256秒。服务循环用到期时间唤醒，不让某个任务睡眠阻塞整个收件队列。无限重试可能持续产生请求费用，请观察日志。

@@ -56,6 +56,16 @@ def _load_settings(config_path: str | Path | None = None) -> dict:
         value = assistant.get(key)
         if type(value) is not int or not 1 <= value <= 65535:
             raise ValueError(f"assistant.{key} 必须是 1 到 65535 之间的整数。")
+    if "graph" in settings:
+        if not isinstance(settings["graph"], dict):
+            raise ValueError("graph 必须是配置对象。")
+        from graph_schema import normalize_settings
+        settings["graph"] = normalize_settings(settings["graph"])
+    if "logging" in settings:
+        if not isinstance(settings["logging"], dict):
+            raise ValueError("logging 必须是配置对象。")
+        from mail_logging import normalize_logging_settings
+        normalize_logging_settings(settings["logging"])
     return settings
 
 
@@ -144,6 +154,7 @@ class MailClient:
     def __init__(self, config_path: str | Path | None = None, auth_code: str | None = None):
         settings = _load_settings(config_path)
         self.assistant = settings["assistant"]
+        self.graph_settings = settings.get("graph")
         self.user_email = settings["user"]["email"]
         auth_code = auth_code or os.getenv(self.assistant["auth_code_env"])
         if not auth_code or not auth_code.strip():

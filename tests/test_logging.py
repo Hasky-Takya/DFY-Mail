@@ -27,6 +27,9 @@ class OutputLoggingTests(unittest.TestCase):
             lock.start()
             self.addCleanup(lock.stop)
         self.directory = Path(self.tmp.name)
+        env = patch.dict(os.environ, {}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
 
     def start(self, script):
         return mail_logging.configure_logging(self.directory, script=script)
@@ -250,11 +253,13 @@ class OutputLoggingTests(unittest.TestCase):
         self.assertNotIn("private-auth", text)
 
     def test_log_start_failure_is_safe(self):
-        with patch.object(mail_logging, "configure_logging", side_effect=OSError("PRIVATE PATH")):
+        with patch.object(mail_logging, "configure_logging", side_effect=OSError("PRIVATE PATH")), \
+             redirect_stderr(io.StringIO()) as terminal:
             with self.assertRaises(SystemExit) as result:
                 mail_logging.start_logging("mail.py")
-        self.assertNotIn("PRIVATE PATH", str(result.exception))
-        self.assertIn("无法创建状态日志", str(result.exception))
+        self.assertEqual(result.exception.code, 1)
+        self.assertNotIn("PRIVATE PATH", terminal.getvalue())
+        self.assertIn("DFY_LOGGING_ERROR", terminal.getvalue())
 
 
 if __name__ == "__main__":

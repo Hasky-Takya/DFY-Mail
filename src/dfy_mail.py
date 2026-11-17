@@ -16,7 +16,8 @@ from dialog_memory import (
     new_record, recent_proactive_subjects, render_email_prompt, send_recorded, summarize,
 )
 from mail import MailClient, _load_settings
-from mail_logging import close_logging, set_log_secrets, start_logging
+from mail_logging import close_logging, set_log_secrets, start_logging, apply_logging_settings
+from runtime_config import require_credential
 from retry_policy import classify_chain, retry_delay
 from task_store import TaskStore, SingleInstanceLock
 import time
@@ -52,6 +53,7 @@ def send_deepseek_email(
     config_path: str | Path | None = None,
     memory_path: str | Path = MEMORY_PATH,
     resume_task: str | None = None,
+    *, graph_settings=None,
 ) -> str:
     """生成并发送一次，返回 Message-ID；失败不自动重试。"""
     prompt = load_prompt(prompt_path)
@@ -62,7 +64,10 @@ def send_deepseek_email(
     set_log_secrets(mailbox._auth_code)
     bot = DeepSeekChat(api_key=api_key)
     secrets = (api_key or os.getenv("DEEPSEEK_API_KEY", ""), mailbox._auth_code)
-    memory = DialogMemory(memory_path, secrets=secrets)
+    if graph_settings is None:
+        configured = getattr(mailbox, "graph_settings", None)
+        graph_settings = configured if isinstance(configured, dict) else None
+    memory = DialogMemory(memory_path, secrets=secrets, graph_settings=graph_settings)
     snapshot = memory.snapshot(include_story=extraction_prompt is not None)
     question = memory.question(
         snapshot, prompt["prompt"], mode="manual_proactive",
@@ -112,6 +117,8 @@ def send_deepseek_email(
                          for item in snapshot["dialogs"]],
                 validation_feedback=validation_feedback,
                 generate_subject=True, recent_subjects=recent_proactive_subjects(snapshot),
+                graph_context=snapshot.get("graph_context"),
+                graph_canonical=snapshot.get("graph_canonical"), graph_settings=memory.graph_settings,
             ))
             break
         except SummaryError as exc:
@@ -148,12 +155,12 @@ def main() -> None:
         load_summary_prompt()
         load_story_extraction_prompt()
         settings = _load_settings()
+        apply_logging_settings(settings.get("logging"))
         set_log_secrets(os.getenv(settings["assistant"]["auth_code_env"], ""))
-        api_key = os.getenv("DEEPSEEK_API_KEY") or getpass("请输入 DeepSeek API Key（不显示）：")
+        api_key = require_credential("DEEPSEEK_API_KEY", "请输入 DeepSeek API Key（不显示）：", input_func=getpass)
         set_log_secrets(api_key)
-        auth_code = os.getenv(settings["assistant"]["auth_code_env"]) or getpass(
-            "请输入助手邮箱客户端授权码（不显示）："
-        )
+        auth_code = require_credential(settings["assistant"]["auth_code_env"],
+                                       "请输入助手邮箱客户端授权码（不显示）：", input_func=getpass)
         set_log_secrets(auth_code)
         logger.info("正在生成邮件并发送给配置用户。")
         options = {"resume_task": args.resume_task} if args.resume_task else {}

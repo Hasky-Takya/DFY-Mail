@@ -18,10 +18,11 @@ from openai import APIConnectionError, APIStatusError, OpenAIError
 from dfy_test import DeepSeekChat
 from dialog_memory import (
     DialogMemory, MEMORY_PATH, MemoryError, SummaryError, ContextBudgetError, load_story_extraction_prompt, load_summary_prompt, new_record,
-    now_iso, redact, render_email_prompt, resolve_reply, send_recorded, summarize,
+    now_iso, redact, render_email_prompt, resolve_reply, send_recorded, summarize, snapshot_basis,
 )
 from mail import MailboxStateError, MailClient, _load_settings
-from mail_logging import close_logging, set_log_secrets, start_logging
+from mail_logging import close_logging, set_log_secrets, start_logging, apply_logging_settings
+from runtime_config import require_credential
 from vision import normalize_user_content, observe_images
 from retry_policy import classify_chain, classify_error, retry_delay
 from task_store import TaskStore, UidValidityChanged, SingleInstanceLock
@@ -71,7 +72,7 @@ class MailReceiver:
         self, mailbox: MailClient, bot: DeepSeekChat, reply_prompt: str, *,
         memory_path: str | Path = MEMORY_PATH, summary_prompt: str | None = None, secrets=(),
         on_user_message=None, extraction_prompt: str | None = None,
-        task_store=None, clock=None,
+        task_store=None, clock=None, graph_settings=None,
     ):
         self.on_user_message = on_user_message
         self.clock = clock or time.time
@@ -91,7 +92,7 @@ class MailReceiver:
         self.mailbox = mailbox
         self.bot = bot
         self.reply_prompt = reply_prompt
-        self.memory = DialogMemory(memory_path, secrets=secrets)
+        self.memory = DialogMemory(memory_path, secrets=secrets, graph_settings=graph_settings)
         self.summary_prompt = summary_prompt if summary_prompt is not None else load_summary_prompt()
         self.stopped = False
         self.cursor = None
@@ -316,11 +317,11 @@ class MailReceiver:
             if self.store.get_control("service:api:paused"):
                 return imap_ok
             current_snapshot = self.memory.snapshot(include_story=self.extraction_prompt is not None)
-            if "snapshot" in task and task["snapshot"]["revision"] != current_snapshot["revision"]:
+            if "snapshot" in task and snapshot_basis(task["snapshot"]) != snapshot_basis(current_snapshot):
                 for key in ("snapshot", "body", "summaries", "validation_feedback"):
                     task.pop(key, None)
             if "snapshot" not in task:
-                task["snapshot"] = self.memory.snapshot(include_story=self.extraction_prompt is not None)
+                task["snapshot"] = current_snapshot
             logger.info(
                 "正在为 UID=%s 调用 DeepSeek，attempt=%s body_chars=%s",
                 message["uid"], task["attempts"] + 1, len(message["body"]),
@@ -363,6 +364,9 @@ class MailReceiver:
                         anchors={"as_of": now_iso(), "received_at": message["received_at"],
                                  "received_at_source": message["received_at_source"]},
                         validation_feedback=task.get("validation_feedback"),
+                        graph_context=task["snapshot"].get("graph_context"),
+                        graph_canonical=task["snapshot"].get("graph_canonical"),
+                        graph_settings=self.memory.graph_settings,
                     )
                 body = task["body"]
             except (OpenAIError, ValueError) as exc:
@@ -494,22 +498,22 @@ def main() -> None:
         instance_lock.acquire()
         logger.info("监听进程启动，日志文件：%s", log_path)
         settings = _load_settings()
+        apply_logging_settings(settings.get("logging"))
         set_log_secrets(os.getenv(settings["assistant"]["auth_code_env"], ""))
         logger.info("邮箱配置加载完成。")
         seconds = interval_seconds(settings)
         prompt = load_reply_prompt()
         summary_prompt = load_summary_prompt()
         extraction_prompt = load_story_extraction_prompt()
-        api_key = os.getenv("DEEPSEEK_API_KEY") or getpass("请输入 DeepSeek API Key（不显示）：")
+        api_key = require_credential("DEEPSEEK_API_KEY", "请输入 DeepSeek API Key（不显示）：", input_func=getpass)
         set_log_secrets(api_key)
-        auth_code = os.getenv(settings["assistant"]["auth_code_env"]) or getpass(
-            "请输入助手邮箱客户端授权码（不显示）："
-        )
+        auth_code = require_credential(settings["assistant"]["auth_code_env"],
+                                       "请输入助手邮箱客户端授权码（不显示）：", input_func=getpass)
         set_log_secrets(api_key, auth_code)
         mailbox = MailClient(auth_code=auth_code)
         bot = DeepSeekChat(api_key=api_key)
         MailReceiver(mailbox, bot, prompt, summary_prompt=summary_prompt, secrets=(api_key, auth_code),
-                     extraction_prompt=extraction_prompt).run(seconds)
+                     extraction_prompt=extraction_prompt, graph_settings=settings.get("graph")).run(seconds)
     except (KeyboardInterrupt, EOFError):
         logger.info("用户中断，监听已停止。若正在发信，请核验收件箱；未处理任务已保存在本地队列。")
     except (MailboxStateError, RuntimeError, ValueError) as exc:

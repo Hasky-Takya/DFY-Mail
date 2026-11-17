@@ -14,6 +14,14 @@ logger = logging.getLogger("dfy.chat")
 logger.addHandler(logging.NullHandler())
 
 
+class ResponseProtocolError(ValueError):
+    """受控的模型响应结构错误，不能让属性访问异常结束服务。"""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__("模型响应不符合协议，code=" + code)
+
+
 class DeepSeekChat:
     """简单的 DeepSeek 问答客户端，每次提问相互独立，不保存历史。"""
 
@@ -65,13 +73,16 @@ class DeepSeekChat:
                 extra_body={"thinking": {"type": "disabled"}},
                 **options,
             )
-            if not response.choices:
-                raise ValueError("DeepSeek 未返回回答。")
-            if response.choices[0].finish_reason != "stop":
-                raise ValueError("DeepSeek 回答未正常完成，可能被截断，未采用本次输出。")
-            answer = response.choices[0].message.content
-            if not answer or not answer.strip():
-                raise ValueError("DeepSeek 返回了空回答。")
+            choices = getattr(response, "choices", None)
+            if not isinstance(choices, (list, tuple)) or not choices:
+                raise ResponseProtocolError("invalid_choices")
+            choice = choices[0]
+            if getattr(choice, "finish_reason", None) != "stop":
+                raise ResponseProtocolError("incomplete_response")
+            message = getattr(choice, "message", None)
+            answer = getattr(message, "content", None)
+            if not isinstance(answer, str) or not answer.strip():
+                raise ResponseProtocolError("invalid_content")
         except Exception as exc:
             logger.error("DeepSeek 请求失败，type=%s duration=%.2fs。",
                          type(exc).__name__, time.perf_counter() - started, exc_info=True)

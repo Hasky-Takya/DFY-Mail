@@ -17,10 +17,11 @@ from dfy_receive import MailReceiver, interval_seconds, load_reply_prompt
 from dfy_test import DeepSeekChat
 from dialog_memory import (
     MEMORY_PATH, PROMPT_PATH, MemoryError, ContextBudgetError, SummaryError, load_story_extraction_prompt, load_summary_prompt, new_record,
-    recent_proactive_subjects, render_prompt, send_recorded, summarize,
+    recent_proactive_subjects, render_prompt, send_recorded, summarize, snapshot_basis,
 )
 from mail import DEFAULT_CONFIG, MailClient, MailboxStateError, _load_settings
-from mail_logging import close_logging, set_log_secrets, start_logging
+from mail_logging import close_logging, set_log_secrets, start_logging, apply_logging_settings
+from runtime_config import require_credential
 from retry_policy import classify_chain, classify_error, retry_delay
 from task_store import SingleInstanceLock
 
@@ -179,7 +180,7 @@ class IdleMailScheduler:
             self.draft["body_attempts"] = 0
             self.draft["summary_attempts"] = 0
         if (self.draft is None or self.draft["version"] != self.activity_version
-                or self.draft["snapshot"]["revision"] != snapshot["revision"]):
+                or snapshot_basis(self.draft["snapshot"]) != snapshot_basis(snapshot)):
             if self.draft is not None and self.draft.get("task_id"):
                 self.receiver.store.finish(self.draft["task_id"])
             self.draft = {
@@ -254,6 +255,9 @@ class IdleMailScheduler:
                     anchors={"as_of": self.now().isoformat(), "received_at": None},
                     validation_feedback=draft.get("validation_feedback"),
                     generate_subject=True, recent_subjects=recent_proactive_subjects(draft["snapshot"]),
+                    graph_context=draft["snapshot"].get("graph_context"),
+                    graph_canonical=draft["snapshot"].get("graph_canonical"),
+                    graph_settings=self.receiver.memory.graph_settings,
                 )
         except (OpenAIError, ValueError) as exc:
             if isinstance(exc, SummaryError):
@@ -310,7 +314,7 @@ class IdleMailScheduler:
             self.receiver.store.save(draft["task_id"], draft)
             return
         if (self.receiver.pending or draft["version"] != self.activity_version
-                or current["revision"] != draft["snapshot"]["revision"]):
+                or snapshot_basis(current) != snapshot_basis(draft["snapshot"])):
             row = self.receiver.store.get(draft["task_id"])
             if row and row["status"] in ("pending", "retry"):
                 self.receiver.store.finish(row["id"])
@@ -396,20 +400,21 @@ def main() -> None:
         instance_lock = SingleInstanceLock(MEMORY_PATH.parent / "service.lock")
         instance_lock.acquire()
         settings = _load_settings(DEFAULT_CONFIG)
+        apply_logging_settings(settings.get("logging"))
         idle_range(settings)
         interval_seconds(settings)
         prompts = load_clock_prompts()
         set_log_secrets(os.getenv(settings["assistant"]["auth_code_env"], ""))
-        api_key = os.getenv("DEEPSEEK_API_KEY") or getpass("请输入 DeepSeek API Key（不显示）：")
+        api_key = require_credential("DEEPSEEK_API_KEY", "请输入 DeepSeek API Key（不显示）：", input_func=getpass)
         set_log_secrets(api_key)
-        auth_code = os.getenv(settings["assistant"]["auth_code_env"]) or getpass("请输入助手邮箱客户端授权码（不显示）：")
+        auth_code = require_credential(settings["assistant"]["auth_code_env"], "请输入助手邮箱客户端授权码（不显示）：", input_func=getpass)
         set_log_secrets(auth_code)
         mailbox = MailClient(config_path=DEFAULT_CONFIG, auth_code=auth_code)
         bot = DeepSeekChat(api_key=api_key)
         receiver = MailReceiver(
             mailbox, bot, prompts["reply_prompt"], summary_prompt=prompts["summary_prompt"],
             memory_path=MEMORY_PATH, secrets=(api_key, auth_code),
-            extraction_prompt=prompts.get("extraction_prompt"),
+            extraction_prompt=prompts.get("extraction_prompt"), graph_settings=settings.get("graph"),
         )
         IdleMailScheduler(receiver, prompts, settings).run()
     except (KeyboardInterrupt, EOFError):
