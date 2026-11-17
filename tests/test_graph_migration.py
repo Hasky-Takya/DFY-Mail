@@ -427,6 +427,69 @@ class GraphMigrationTests(unittest.TestCase):
         self.assertEqual(len(bot.calls), 3)
         self.assertEqual(len(bot.calls[-1][0]["sources"]), 1)
 
+    def test_duplicate_facts_are_repaired_with_exactly_one_source_view(self):
+        self.seed(complete=False)
+        class RepairBot(FakeBot):
+            def ask(self, question, **kwargs):
+                raw = json.loads(super().ask(question, **kwargs))
+                if len(self.calls) == 1:
+                    facts = raw["annotations"][0]["candidate"]["facts"]
+                    facts.append(copy.deepcopy(facts[0]))
+                return json.dumps(raw)
+        bot = RepairBot()
+        result = migration.annotate(self.directory, llm=True, confirm_api=True,
+                                    api_key="synthetic", bot_factory=lambda **kwargs: bot)
+        self.assertEqual(result["imported"], 1)
+        self.assertEqual(len(bot.calls), 2)
+        self.assertEqual(bot.calls[1][0]["repair"]["error"]["path"], "facts")
+        self.assertEqual(len(migration._read_annotations(self.directory)[0]["package"]["facts"]), 1)
+
+    def test_later_failure_keeps_prior_source_checkpoint_and_resume_skips_it(self):
+        data, context = self.seed(complete=False)
+        row, context = sent_record("dialog-2", context=context, complete=False, at=LATER)
+        data["dialogs"].append(row)
+        data["revision"] = 2
+        write_json(self.directory / "dialog.json", data)
+        class FailingBot(FakeBot):
+            def ask(self, question, **kwargs):
+                response = super().ask(question, **kwargs)
+                if len(self.calls) > 1:
+                    raise RuntimeError("PRIVATE_TEXT")
+                return response
+        bot = FailingBot()
+        with self.assertRaises(migration.MigrationError) as caught:
+            migration.annotate(self.directory, {"batch_size": 2}, llm=True,
+                               confirm_api=True, api_key="synthetic", bot_factory=lambda **kwargs: bot)
+        self.assertEqual(caught.exception.code, "api_failed")
+        self.assertEqual(caught.exception.details["stage"], "request")
+        self.assertEqual(caught.exception.details["saved_sources"], 1)
+        entries = migration._read_annotations(self.directory)
+        self.assertEqual(len(entries), 1)
+        first_source = entries[0]["package"]["facts"][0]["ref"]
+        resumed = FakeBot()
+        result = migration.annotate(self.directory, {"batch_size": 2}, llm=True,
+                                    confirm_api=True, api_key="synthetic", bot_factory=lambda **kwargs: resumed)
+        self.assertEqual(result["imported"], 1)
+        self.assertEqual(len(resumed.calls), 1)
+        self.assertNotEqual(resumed.calls[0][0]["sources"][0]["item"]["id"], first_source)
+
+    def test_validation_exhaustion_reports_safe_details_not_api_error(self):
+        self.seed(complete=False)
+        bot = FakeBot()
+        def invalid(question, **kwargs):
+            response = json.loads(FakeBot.ask(bot, question, **kwargs))
+            response["annotations"][0]["candidate"]["facts"][0]["evidence"] = "PRIVATE_NOT_IN_SOURCE"
+            return json.dumps(response)
+        bot.ask = invalid
+        with self.assertRaises(migration.MigrationError) as caught:
+            migration.annotate(self.directory, llm=True, confirm_api=True,
+                               api_key="synthetic", bot_factory=lambda **kwargs: bot, max_attempts=2)
+        self.assertEqual(caught.exception.code, "annotation_validation_failed")
+        self.assertEqual(caught.exception.details["validation"]["code"], "evidence_not_in_source")
+        self.assertEqual(len(bot.calls), 2)
+        self.assertNotIn("PRIVATE", json.dumps(caught.exception.details))
+        self.assertFalse((self.directory / migration.ANNOTATIONS).exists())
+
     def test_offline_import_atomic_validated_and_idempotent(self):
         self.seed(complete=False)
         bot = FakeBot()
@@ -466,7 +529,7 @@ class GraphMigrationTests(unittest.TestCase):
         self.seed(complete=False)
         bot = FakeBot()
         bot.ask = lambda *args, **kwargs: '{"private text":"PRIVATE_BODY"}'
-        self.assert_code("invalid_annotation", migration.annotate, self.directory, llm=True,
+        self.assert_code("annotation_validation_failed", migration.annotate, self.directory, llm=True,
                          confirm_api=True, api_key="synthetic", bot_factory=lambda **kwargs: bot)
         self.assertFalse((self.directory / migration.ANNOTATIONS).exists())
         self.assertFalse((self.directory / graph_store.DB_FILENAME).exists())

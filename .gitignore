@@ -21,4 +21,5 @@ deepseek-json-prompt-deepseek-deepseek-toasty-shannon.md
 DFY-Mail.zip
 
 /deliverables/
-# Documentation and deployment tools are versioned.
+/docs/
+/tools/
