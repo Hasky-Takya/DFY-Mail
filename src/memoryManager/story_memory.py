@@ -614,64 +614,6 @@ def _atomic_write(path, data):
                 pass
 
 
-class ProjectionValidationError(StoryValidationError):
-    """A projection mismatch, distinguished from a damaged committed package."""
-
-
-def replay_checked(dialog_data, projections=None):
-    """Stream canonical history, verifying only requested projection revisions.
-
-    Retains current state, not a full context per revision. Callers may write
-    repairs only after this function has validated BOTH projection prefixes.
-    """
-    if not isinstance(dialog_data, dict) or not isinstance(dialog_data.get("dialogs"), list):
-        _fail("Invalid dialog data.")
-    projections = projections or {}
-    wanted = {}
-    for kind, data in projections.items():
-        if kind not in KINDS:
-            _fail("Invalid projection kind.")
-        if data is None:
-            continue
-        if (not isinstance(data, dict) or type(data.get("schema_version")) is not int
-                or data["schema_version"] != 1 or type(data.get("revision")) is not int
-                or data["revision"] < 0):
-            raise ProjectionValidationError("Invalid projection schema/revision.")
-        wanted.setdefault(data["revision"], []).append((kind, data))
-    current = empty_context()
-    seen = set()
-
-    def check():
-        for kind, data in wanted.pop(current["revision"], []):
-            if not _same(data, _projection(current, kind)):
-                raise ProjectionValidationError("Projection is not an exact committed log prefix.")
-
-    check()
-    for record in dialog_data["dialogs"]:
-        if not isinstance(record, dict):
-            _fail("Invalid dialog record.")
-        if record.get("status") != "sent" or "story_updates" not in record:
-            continue
-        package = record["story_updates"]
-        validate_package(package)
-        if record.get("id") != package["dialog_id"] or record["id"] in seen:
-            _fail("Story package dialog binding conflicts.")
-        seen.add(record["id"])
-        for field in ("event_updates", "memory_updates"):
-            for item in package[field]:
-                ref = item["source_refs"][-1]
-                key = "user_message_id" if ref["source"] == "user" else "assistant_message_id"
-                if ref["message_id"] != record.get(key):
-                    _fail("Story reference Message-ID does not match its dialog.")
-                if ref["source"] == "user" and record.get("type") == "deepseek自己主动发送":
-                    _fail("Proactive mail cannot contain user evidence.")
-        current = _apply(current, package)
-        check()
-    if wanted:
-        raise ProjectionValidationError("Projection revision is outside the committed log.")
-    return current
-
-
 def reconcile_locked(dialog_data, directory) -> dict:
     """Verify BOTH projection prefixes before either write, then repair lagging files.
 
@@ -681,24 +623,45 @@ def reconcile_locked(dialog_data, directory) -> dict:
     is recoverable on the next call; never resend mail in response to StoryError.
     """
     try:
+        if not isinstance(dialog_data, dict) or not isinstance(dialog_data.get("dialogs"), list):
+            _fail("Invalid dialog data.")
+        contexts = [empty_context()]
+        seen_dialogs = set()
+        for record in dialog_data["dialogs"]:
+            if not isinstance(record, dict):
+                _fail("Invalid dialog record.")
+            if record.get("status") != "sent" or "story_updates" not in record:
+                continue
+            package = record["story_updates"]
+            validate_package(package)
+            if record.get("id") != package["dialog_id"] or record["id"] in seen_dialogs:
+                _fail("Story package dialog binding conflicts.")
+            seen_dialogs.add(record["id"])
+            for key in ("event_updates", "memory_updates"):
+                for item in package[key]:
+                    ref = item["source_refs"][-1]
+                    message_key = "user_message_id" if ref["source"] == "user" else "assistant_message_id"
+                    if ref["message_id"] != record.get(message_key):
+                        _fail("Story reference Message-ID does not match its dialog.")
+                    if ref["source"] == "user" and record.get("type") == "deepseek自己主动发送":
+                        _fail("Proactive mail cannot contain user evidence.")
+            contexts.append(_apply(contexts[-1], package))
+        final = contexts[-1]
         directory = Path(directory)
         pending = []
-        try:
-            from graph_store import event_filename
-        except ModuleNotFoundError as exc:
-            if exc.name != "graph_store":
-                raise
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("graph_store", Path(__file__).with_name("graph_store.py"))
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            event_filename = module.event_filename
-        paths = {kind: directory / filename for kind, filename in (("events", event_filename(directory)), ("memories", "memory.json"))}
-        projections = {kind: _read_projection(path) for kind, path in paths.items()}
-        final = replay_checked(dialog_data, projections)
-        for kind, path in paths.items():
+        for kind, filename in (("events", "event.json"), ("memories", "memory.json")):
+            path = directory / filename
+            data = _read_projection(path)
+            if data is not None:
+                if not isinstance(data, dict) or type(data.get("schema_version")) is not int or data.get("schema_version") != 1:
+                    _fail("Invalid projection schema version.")
+                revision = data.get("revision")
+                if type(revision) is not int or not 0 <= revision < len(contexts):
+                    _fail("Projection revision is outside the committed log.")
+                if not _same(data, _projection(contexts[revision], kind)):
+                    _fail("Projection is not an exact committed log prefix.")
             target = _projection(final, kind)
-            if projections[kind] != target:
+            if data != target:
                 pending.append((path, target))
         if pending:
             directory.mkdir(parents=True, exist_ok=True)

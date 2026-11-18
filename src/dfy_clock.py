@@ -15,15 +15,15 @@ from openai import APIConnectionError, APIStatusError, OpenAIError
 
 from dfy_receive import MailReceiver, interval_seconds, load_reply_prompt
 from dfy_test import DeepSeekChat
-from dialog_memory import (
+from dialogueManager.dialog_memory import (
     MEMORY_PATH, PROMPT_PATH, MemoryError, ContextBudgetError, SummaryError, load_story_extraction_prompt, load_summary_prompt, new_record,
-    recent_proactive_subjects, render_prompt, send_recorded, summarize, snapshot_basis,
+    recent_proactive_subjects, render_prompt, send_recorded, snapshot_matches, summarize,
 )
 from mail import DEFAULT_CONFIG, MailClient, MailboxStateError, _load_settings
-from mail_logging import close_logging, set_log_secrets, start_logging, apply_logging_settings
-from runtime_config import require_credential
+from mail_logging import close_logging, set_log_secrets, start_logging
 from retry_policy import classify_chain, classify_error, retry_delay
 from task_store import SingleInstanceLock
+
 
 
 POSITIVE_PROMPT_PATH = PROMPT_PATH.with_name("positive_prompt.json")
@@ -129,7 +129,7 @@ class IdleMailScheduler:
         if self.deadline is not None:
             raise RuntimeError("随机主动来信实例已经启动。")
         self.receiver.start()
-        snapshot = self.receiver.recover_memory() or {"dialogs": []}
+        snapshot = self.receiver.recover_memory()
         activity = None if self.receiver.paused else self.receiver.mailbox.latest_user_activity(self.receiver.cursor)
         candidates = []
         if activity is not None:
@@ -139,15 +139,18 @@ class IdleMailScheduler:
                 logger.warning("最近用户来信缺少可靠接收时间，按启动时间保守计时。")
                 received = self.now()
             candidates.append(received)
-        for record in snapshot["dialogs"]:
-            if record["status"] != "sent":
-                continue
-            field = "sent_at" if record["type"] == "deepseek自己主动发送" else "received_at"
-            value = parse_time(record.get(field))
-            if value is not None:
-                candidates.append(value)
-        activity_at = max(candidates) if candidates else self.now()
+        if snapshot is not None:
+            for record in snapshot["dialogs"]:
+                if record["status"] != "sent":
+                    continue
+                field = "sent_at" if record["type"] == "deepseek自己主动发送" else "received_at"
+                value = parse_time(record.get(field))
+                if value is not None:
+                    candidates.append(value)
         saved_timer = self.receiver.store.get_control("clock:timer")
+        # 恢复被拦截时没有历史作为参考，不能因此丢掉已持久化的空闲计时。
+        fallback = parse_time(saved_timer.get("activity")) if snapshot is None and saved_timer else None
+        activity_at = max(candidates) if candidates else fallback or self.now()
         drafts = self.receiver.store.list_tasks(account=self.receiver.account, kind="proactive")
         self.reset(activity_at, "启动历史基线")
         if saved_timer:
@@ -175,12 +178,14 @@ class IdleMailScheduler:
                 self.draft["version"] = self.activity_version
                 self.draft["next_attempt_at"] = row["next_attempt_at"]
         if self.draft is not None and "snapshot" not in self.draft:
+            for key in ("body", "summaries", "validation_feedback"):
+                self.draft.pop(key, None)
             self.draft["snapshot"] = snapshot
             self.draft["version"] = self.activity_version
             self.draft["body_attempts"] = 0
             self.draft["summary_attempts"] = 0
         if (self.draft is None or self.draft["version"] != self.activity_version
-                or snapshot_basis(self.draft["snapshot"]) != snapshot_basis(snapshot)):
+                or not snapshot_matches(self.draft["snapshot"], snapshot)):
             if self.draft is not None and self.draft.get("task_id"):
                 self.receiver.store.finish(self.draft["task_id"])
             self.draft = {
@@ -197,15 +202,19 @@ class IdleMailScheduler:
             if self.receiver.recover_memory() is None:
                 self.receiver.poll_once()
                 return
-            self.stopped = False
             row = self.receiver.store.get(task_id) if task_id else None
+            if row and row["status"] in ("sending", "unknown", "blocked_unknown"):
+                self.receiver.poll_once()
+                return
+            self.stopped = False
             self.draft = None
-            if row and row["status"] == "done":
+            if row and row["status"] == "done" and row["dialog_id"]:
                 self.reset(self.now(), "发送后本地记忆恢复成功")
                 return
-            if row and row["status"] == "pending":
+            if row and row["status"] in ("pending", "retry"):
                 self.draft = row["payload"]
                 self.draft["task_id"] = row["id"]
+                self.draft["next_attempt_at"] = row["next_attempt_at"]
         if self.receiver.store.get_control("service:api:paused"):
             self.receiver.poll_once()
             return
@@ -255,9 +264,6 @@ class IdleMailScheduler:
                     anchors={"as_of": self.now().isoformat(), "received_at": None},
                     validation_feedback=draft.get("validation_feedback"),
                     generate_subject=True, recent_subjects=recent_proactive_subjects(draft["snapshot"]),
-                    graph_context=draft["snapshot"].get("graph_context"),
-                    graph_canonical=draft["snapshot"].get("graph_canonical"),
-                    graph_settings=self.receiver.memory.graph_settings,
                 )
         except (OpenAIError, ValueError) as exc:
             if isinstance(exc, SummaryError):
@@ -309,12 +315,12 @@ class IdleMailScheduler:
             return
         if self.receiver.blocked_reason:
             return
-        current = self.receiver.memory.snapshot()
         if not imap_ok:
             self.receiver.store.save(draft["task_id"], draft)
             return
+        current = self.receiver.memory.snapshot(include_story=self.receiver.extraction_prompt is not None)
         if (self.receiver.pending or draft["version"] != self.activity_version
-                or snapshot_basis(current) != snapshot_basis(draft["snapshot"])):
+                or not snapshot_matches(draft["snapshot"], current)):
             row = self.receiver.store.get(draft["task_id"])
             if row and row["status"] in ("pending", "retry"):
                 self.receiver.store.finish(row["id"])
@@ -326,24 +332,22 @@ class IdleMailScheduler:
             return
         subject = draft["summaries"]["mail_subject"]
         record = new_record(draft["snapshot"], None, draft["summaries"], subject=subject)
-        self.stopped = True  # 任何发送异常都不得再次 tick 重发。
+        self.stopped = True  # 发送异常后须先恢复持久记录，不能直接重入 SMTP。
         logger.info("发送主动邮件，结果未确认前不重入发送。")
-        self.receiver.store.save(draft["task_id"], draft, status="sending", dialog_id=record["id"])
         try:
             send_recorded(
                 self.receiver.memory, draft["snapshot"], record, self.receiver.mailbox,
-                subject, draft["body"],
+                subject, draft["body"], store=self.receiver.store,
+                task_id=draft["task_id"], task_payload=draft,
             )
         except (MemoryError, OSError, ValueError) as exc:
-            severity, code = classify_chain(exc, "smtp")
+            _, code = classify_chain(exc, "smtp")
             if code in ("smtp_auth_failed", "tls_verification_failed"):
                 self.receiver.store.set_control("service:smtp:paused", code)
                 logger.critical("SMTP服务暂停，code=%s；发送结果待核验，不自动重发。", code)
-            self.receiver.store.save(draft["task_id"], draft, status="blocked_unknown",
-                                     dialog_id=record["id"], error_code="send_or_projection_unconfirmed")
-            logger.critical("主动发送已暂停，code=send_or_projection_unconfirmed type=%s；不自动重发。", type(exc).__name__)
+            detail = str(exc) if isinstance(exc, MemoryError) else type(exc).__name__
+            logger.critical("主动发送已暂停，code=send_or_projection_unconfirmed；%s 先恢复记录。", detail)
             return
-        self.receiver.store.finish(draft["task_id"])
         logger.info("主动邮件已由 SMTP 接受且记忆确认，不保证最终投递。")
         self.stopped = False
         self.reset(self.now(), "主动发送成功")
@@ -378,7 +382,7 @@ class IdleMailScheduler:
                 self.tick()
             except MemoryError as exc:
                 self.receiver.blocked_reason = "memory_recovery_required"
-                logger.critical("写信暂停，code=memory_recovery_required type=%s；保留队列，下轮恢复本地记忆。", type(exc).__name__)
+                logger.critical("写信暂停，code=memory_recovery_required；%s 保留队列，下轮恢复本地记忆。", exc)
             now = self.monotonic()
             waits = [self.seconds]
             wall = self.receiver.clock()
@@ -400,25 +404,27 @@ def main() -> None:
         instance_lock = SingleInstanceLock(MEMORY_PATH.parent / "service.lock")
         instance_lock.acquire()
         settings = _load_settings(DEFAULT_CONFIG)
-        apply_logging_settings(settings.get("logging"))
         idle_range(settings)
         interval_seconds(settings)
         prompts = load_clock_prompts()
         set_log_secrets(os.getenv(settings["assistant"]["auth_code_env"], ""))
-        api_key = require_credential("DEEPSEEK_API_KEY", "请输入 DeepSeek API Key（不显示）：", input_func=getpass)
+        api_key = os.getenv("DEEPSEEK_API_KEY") or getpass("请输入 DeepSeek API Key（不显示）：")
         set_log_secrets(api_key)
-        auth_code = require_credential(settings["assistant"]["auth_code_env"], "请输入助手邮箱客户端授权码（不显示）：", input_func=getpass)
+        auth_code = os.getenv(settings["assistant"]["auth_code_env"]) or getpass("请输入助手邮箱客户端授权码（不显示）：")
         set_log_secrets(auth_code)
         mailbox = MailClient(config_path=DEFAULT_CONFIG, auth_code=auth_code)
         bot = DeepSeekChat(api_key=api_key)
         receiver = MailReceiver(
             mailbox, bot, prompts["reply_prompt"], summary_prompt=prompts["summary_prompt"],
             memory_path=MEMORY_PATH, secrets=(api_key, auth_code),
-            extraction_prompt=prompts.get("extraction_prompt"), graph_settings=settings.get("graph"),
+            extraction_prompt=prompts.get("extraction_prompt"),
         )
         IdleMailScheduler(receiver, prompts, settings).run()
     except (KeyboardInterrupt, EOFError):
         logger.info("用户中断；如正在发信请核验收件箱及记忆，勿盲目重跑。")
+    except MemoryError as exc:
+        logger.critical("随机主动来信停止；%s", exc)
+        raise SystemExit(1) from None
     except Exception as exc:
         logger.critical("随机主动来信停止，type=%s；如已进入发送请先核验收件箱及记忆。",
                         type(exc).__name__, exc_info=True)

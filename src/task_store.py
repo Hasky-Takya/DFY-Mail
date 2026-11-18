@@ -1,11 +1,9 @@
 """Durable, standard-library task queue. Importing this module performs no I/O.
 
-Runtime contract: TaskStore(memory_path.parent / "tasks.sqlite3").  Ingest
-returns task rows; the mutable work/cache dictionary is row["payload"].  Save a
-bound ``sending`` row BEFORE SMTP (and before preparing its dialog), then finish
-only after a confirmed send. Reconcile against the complete dialog snapshot on
-restart. A dialog in prepared/sending/unknown is never automatically resent.
-Neither this module nor its maintenance CLI logs or prints message payloads.
+Ingest returns task rows; the mutable work/cache dictionary is row["payload"].
+The send coordinator stages, arms, and records SMTP acceptance here before
+committing the local JSON files. Neither this module nor its maintenance CLI
+logs or prints message payloads.
 """
 
 import argparse
@@ -462,8 +460,65 @@ class TaskStore:
             raise KeyError("Task does not exist")
         return task
 
+    def send_rows(self, account="default-mailbox"):
+        return self.list_tasks(statuses=tuple(_UNSAFE), kind=None, account=account)
+
+    def completed_dialog_ids(self, account):
+        return {row["dialog_id"] for row in self.connection.execute(
+            "SELECT dialog_id FROM tasks WHERE account=? AND status='done' AND dialog_id IS NOT NULL",
+            (_text(account),),
+        )}
+
+    def stage_send(self, task_id, payload, plan):
+        if plan["phase"] != "staged" or "send_plan" in payload:
+            raise TaskStoreError("Invalid new send plan")
+        with self._transaction():
+            task = self._required(task_id)
+            if task["status"] not in ("pending", "retry") or task["dialog_id"] is not None:
+                raise TaskStoreError("Task is not available for a new send plan")
+            self.connection.execute(
+                "UPDATE tasks SET status='sending',dialog_id=?,payload=?,next_attempt_at=0,error_code=NULL,updated_at=? WHERE id=?",
+                (_text(plan["record"]["id"]), _dump(dict(payload, send_plan=plan)), time.time(), task_id),
+            )
+
+    def _planned(self, task_id, phase):
+        task = self._required(task_id)
+        plan = task["payload"].get("send_plan")
+        if task["status"] != "sending" or not isinstance(plan, dict) or plan.get("phase") != phase:
+            raise TaskStoreError("Unexpected durable send phase")
+        return task
+
+    def _advance_send(self, task_id, phase, next_phase, sent_at=None):
+        with self._transaction():
+            task = self._planned(task_id, phase)
+            task["payload"]["send_plan"].update(phase=next_phase, sent_at=sent_at)
+            self.connection.execute("UPDATE tasks SET payload=?,updated_at=? WHERE id=?",
+                                    (_dump(task["payload"]), time.time(), task_id))
+
+    def arm_send(self, task_id):
+        self._advance_send(task_id, "staged", "armed")
+
+    def accept_send(self, task_id, sent_at):
+        self._advance_send(task_id, "armed", "accepted", _text(sent_at))
+
+    def release_send(self, task_id):
+        """Caller verified SMTP was never armed and removed any prepared record."""
+        with self._transaction():
+            task = self._planned(task_id, "staged")
+            del task["payload"]["send_plan"]
+            self.connection.execute(
+                "UPDATE tasks SET status='pending',dialog_id=NULL,payload=?,next_attempt_at=0,error_code=NULL,updated_at=? WHERE id=?",
+                (_dump(task["payload"]), time.time(), task_id),
+            )
+
+    def finish_send(self, task_id):
+        """Caller verified all JSON files have been committed."""
+        with self._transaction():
+            self._planned(task_id, "accepted")
+            self._finish(task_id)
+
     def save(self, task_id, payload, status="pending", next_attempt_at=0, error_code=None, dialog_id=None):
-        if status not in _STATUSES or not isinstance(payload, dict):
+        if status not in _STATUSES or not isinstance(payload, dict) or "send_plan" in payload:
             raise ValueError("Invalid task status or payload")
         _deadline(next_attempt_at)
         if error_code is not None:
@@ -473,6 +528,8 @@ class TaskStore:
         encoded = _dump(payload)
         with self._transaction():
             task = self._required(task_id)
+            if "send_plan" in task["payload"]:
+                raise TaskStoreError("A durable send plan cannot be overwritten by ordinary task saves")
             bound_dialog = dialog_id if dialog_id is not None else task["dialog_id"]
             if task["status"] == "done" and status != "done":
                 raise TaskStoreError("Completed task cannot be reopened")
@@ -536,49 +593,13 @@ class TaskStore:
         )
 
     def finish(self, task_id):
-        """Caller attests that the bound dialog was confirmed sent."""
+        """Complete an unbound task (for example an empty mail or canceled draft)."""
         with self._transaction():
-            self._required(task_id)
+            task = self._required(task_id)
+            if task["dialog_id"] is not None or task["status"] in _UNSAFE or "send_plan" in task["payload"]:
+                raise TaskStoreError("A bound send requires confirmation before completion")
             self._finish(task_id)
         return self.get(task_id)
-
-    def reconcile(self, dialog_records):
-        """Use a COMPLETE dialog snapshot; absent sending plans are safe to requeue.
-
-        The caller must save sending before preparing its dialog, so a missing
-        dialog proves SMTP could not yet have started. Unknown/blocked_unknown
-        remain blocked even if their dialog is missing.
-        """
-        if isinstance(dialog_records, dict):
-            dialog_records = dialog_records["dialogs"]
-        records = {}
-        for record in dialog_records:
-            identifier = _text(record.get("id", record.get("dialog_id")))
-            status = record.get("status")
-            if status not in {"sent", "prepared", "sending", "unknown"} or identifier in records:
-                raise ValueError("Invalid or duplicate dialog metadata")
-            records[identifier] = status
-        counts = {"done": 0, "blocked_unknown": 0, "pending": 0}
-        with self._transaction():
-            tasks = self.connection.execute("SELECT id,status,dialog_id FROM tasks WHERE status!='done'").fetchall()
-            for task in tasks:
-                dialog_status = records.get(task["dialog_id"])
-                if dialog_status == "sent":
-                    self._finish(task["id"])
-                    counts["done"] += 1
-                elif dialog_status is not None or task["status"] in {"unknown", "blocked_unknown"}:
-                    self.connection.execute(
-                        "UPDATE tasks SET status='blocked_unknown',error_code='send_outcome_unknown',updated_at=? WHERE id=?",
-                        (time.time(), task["id"]),
-                    )
-                    counts["blocked_unknown"] += 1
-                elif task["status"] == "sending":
-                    self.connection.execute(
-                        "UPDATE tasks SET status='pending',dialog_id=NULL,error_code=NULL,next_attempt_at=0,updated_at=? WHERE id=?",
-                        (time.time(), task["id"]),
-                    )
-                    counts["pending"] += 1
-        return counts
 
     def set_control(self, key, value):
         with self._transaction():
@@ -597,6 +618,21 @@ class TaskStore:
     def delete_control(self, key):
         with self._transaction():
             self.connection.execute("DELETE FROM controls WHERE key=?", (_text(key),))
+
+
+def open_task_store(directory):
+    """Open the runtime queue without replacing an initialized but missing database."""
+    path = Path(directory) / "tasks.sqlite3"
+    marker = path.with_suffix(".initialized")
+    try:
+        if marker.exists() and (not path.is_file() or path.stat().st_size == 0):
+            raise TaskStoreError("持久任务库缺失或为空，code=queue_missing；请恢复同一时点的备份。")
+        store = TaskStore(path)
+        if not marker.exists():
+            marker.write_text("durable-queue-v1\n", encoding="ascii")
+        return store
+    except (OSError, sqlite3.Error) as exc:
+        raise TaskStoreError(f"无法打开持久任务库（{type(exc).__name__}）。") from exc
 
 
 def main(argv=None):

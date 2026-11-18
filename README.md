@@ -43,15 +43,17 @@
 │  ├─ dfy_mail.py               # 生成并发送一封主动邮件
 │  ├─ dfy_receive.py            # 新邮件监听与自动回复
 │  ├─ dfy_clock.py              # 统一收信回复及随机主动来信
-│  ├─ dialog_memory.py          # 梗概、历史上下文与发送记录
-│  ├─ story_memory.py           # 事件／长期记忆校验与可恢复投影
+│  ├─ dialogueManager/dialog_memory.py  # 梗概、历史上下文与发送恢复
+│  ├─ memoryManager/story_memory.py     # 事件／长期记忆提取协议与校验
+│  ├─ memoryManager/batch_store.py      # v2 批次读写与核对
+│  ├─ migrate_dialog_memory.py          # 离线导出 v2 三份 JSON
 │  ├─ mail_images.py            # MIME图片提取、限额与Pillow验证
 │  ├─ vision.py                 # 缓存视觉观察与规范化来信
 │  └─ mail_logging.py           # 日志轮转及脱敏
 ├─ memory/
-│  ├─ dialog.json               # 对话梗概及已验证的故事更新包
-│  ├─ event.json                # 计划／进行／结束事件与人物、时态
-│  ├─ memory.json               # 长期设定、偏好、关系与约定
+│  ├─ dialog.json               # v2 对话梗概及发送元数据
+│  ├─ event.json                # v2 事件更新批次
+│  ├─ memory.json               # v2 长期记忆更新批次
 │  └─ README.md                 # 记忆字段与人工核验说明
 ├─ log/output_log/              # 各入口自动创建状态日志
 │  ├─ dfy_test.log
@@ -234,31 +236,15 @@ python src/dfy_clock.py
 
 主题不合格会进入原有安全反馈修复，最多三次；不重新生成正文、不额外增加纯文字API请求，不偷偷回落固定主题。配置subject保留旧配置兼容但不再决定正常主动发送主题。普通回复的Re、In-Reply-To和References保持不变。
 
-### 2 核 2 GB 服务器与文件日志
-
-完整部署步骤见 [2核2GB部署清单](docs/deploy_2c2g.md)，统一 service 模板为 `deploy/dfy-mail.service.example`（clock 入口，同时收信和主动联系）。不要与旧service并行运行，不要把本地memory覆盖服务器最新数据。模板需按实际路径/用户调整；当前仅离线验证，尚未远程部署。
-
-`settings_example.json` 的 `logging` 节集中配置文件/控制台级别、日期与体积轮转及备份数；默认 UTF-8 INFO 日志写入 `log/output_log/dfy_clock.log`，可用 `DFY_LOG_DIR` 覆盖目录。启动会实际写入/flush探针，不能写文件即失败；运行期故障会在 stderr/journal 输出 `DFY_LOGGING_ERROR`，不能长期忽略。无TTY缺凭据会非零退出，不再等待交互输入。
-
-故事前缀核验采用流式回放，不保留全部历史context；图谱SQLite默认8MiB缓存。资源限制与本地内存测量不是目标服务器容量保证，仍须观察RSS、图片负载、磁盘和重启次数。
-
-### 单句事件与轻量知识图谱（可选）
-
-新增图谱仅是已提交故事与冻结标注的可重建投影；原 `dialog.json` 仍是发送恢复和故事更新依据。`config/settings_example.json` 的 `graph` 小节列出全部可调参数；将该节复制到实际 `settings.json`，设置 `enabled: true` 后启用。旧配置默认关闭，不会自动覆盖 `event.json`。
-
-启用后生成 `graph_store.sqlite3` 和 `event_v2.json`，包括单句事实、实体别名、人物关系/状态及事件关系。新发信的图谱候选与核心摘要共用一次模型请求，核心非法仍阻断；图谱子对象非法标记 incomplete，不写坏数据。只有 sent 记录应用图谱；新派生故障不触发重复发信。当前仅接受本轮文字证据，图片单独观察不直接生成图谱事实。
-
-完整配置、历史整理、正式切换和回滚见 [图谱使用指南](docs/event_graph.md)。迁移不会自动执行，需先停服务、备份，并在副本验证。正式切换后旧事件投影保存在 `event_legacy.json`，新 `event.json` 使用独立 schema；**不能用旧版程序直接读取新格式，也不能删除 dialog 修复图谱**。
-
 ### 长期运行、退避与隔离恢复
 
 模型请求临时错误（连接中断、超时、408/409/429/5xx）无限重传，第n次重传等待 `min(2**n,256)` 秒，即2、4、8、16、32、64、128、256秒，此后保持256秒。服务循环用到期时间唤醒，不让某个任务睡眠阻塞整个收件队列。无限重试可能持续产生请求费用，请观察日志。
 
 模型输出／证据／主题不合格仍最多修正三次，但耗尽后把该任务置为quarantined保留正文、生成缓存和错误码，继续处理其他邮件。API认证/权限/额度、邮箱认证和证书校验错误写CRITICAL安全日志并暂停相应服务，不无限盲试密钥。SMTP结果不确定仍不可重发。
 
-近期上下文是临时策略，尚未使用RAG：默认最近20轮对话、最近20事件和20长期记忆，按时间选择；超60k字符预算逐步减少最旧可选项，源文件完整保留。模型不接收完整来源轨迹，但本地保留验证和更新所需canonical记录；不允许更新本次未提供的ID。当前邮件本身超限则隔离，不截断用户内容。
+近期上下文尚未使用 RAG：对话、事件和长期记忆各取最近 `RECENT_LIMIT` 项（当前为 35），同一事件或记忆仅取最新版本；超 60,000 字符预算时再减少较旧的可选项，源文件完整保留。模型只看到近期来源，不允许更新本次未提供的 ID。当前邮件本身超限则隔离，不截断用户内容。
 
-持久状态位于 `memory/tasks.sqlite3`，同目录 `tasks.initialized` 用于检测已有队列丢失，`service.lock` 防止clock多实例。首次旧版升级可新建队列；已初始化后数据库缺失会报错而不是悄悄跳过旧信。备份/迁移请停机并连同三份记忆JSON、SQLite及标记一并复制。队列短期保存待处理原文、图片和修复输出（权限尽量0600，默认不加密）；done后清除任务／入站正文载荷，仅留去重标识，隔离任务保留待人工恢复。
+持久状态位于 `memory/tasks.sqlite3`，同目录 `tasks.initialized` 用于检测已有队列丢失。三个 AI 发信入口共用 `service.lock` 防止并行运行，`dialog.json.lock` 保护三份 JSON 的读写和发送提交。进程退出后操作系统释放锁，文件仍在不代表被占用；不要删除锁文件来解锁。备份/迁移请停机并连同三份记忆 JSON、SQLite 及标记一并复制。队列短期保留待处理原文、图片、修复输出及冻结的发送计划（权限尽量 0600，默认不加密）；完成后清除任务与入站正文载荷，隔离任务保留待人工恢复。
 
 只查看元数据：
 
@@ -281,7 +267,7 @@ python src/task_store.py --db memory/tasks.sqlite3 unpause service:imap:paused
 python src/task_store.py --db memory/tasks.sqlite3 unpause service:smtp:paused
 ```
 
-reply/proactive隔离任务释放后由clock恢复；manual任务释放后另执行 `python src/dfy_mail.py --resume-task 任务ID`（先停常驻服务，避免双实例）。只能对quarantined执行retry，不允许直接释放sending/unknown。先人工核验对应dialog发送结果；确认sent后程序自动仅恢复本地投影并结束队列任务。记忆损坏/磁盘暂不可写暂停发送但继续尽可能接收，修好后每轮尝试本地恢复，不重发SMTP；无法写持久队列本身时必须停止并保留磁盘数据，不能假装安全接收。
+reply/proactive 隔离任务释放后由 clock 恢复；manual 任务释放后另执行 `python src/dfy_mail.py --resume-task 任务ID`（先停常驻服务）。`retry` 只允许释放 quarantined 任务。SMTP 已接受且 SQLite 有确认时，程序只补本地文件，不重发；没有持久确认的发送必须人工核验，不能用 `retry` 或手改 JSON 代替。记忆损坏或磁盘暂不可写时暂停发送并尽可能继续接收入队；无法写持久队列时停止，保留原有数据。
 
 ## 4. 其他脚本用法
 
@@ -385,13 +371,13 @@ LLM 根据本轮用户和助手原文以及已有条目判断新增或更新，�
 
 只提取新版本之后成功确认的邮件往来，不批量回填旧梗概；没有值得记住的内容可返回空更新。未发送或被取消的草稿不进入正式事件。用户信息也随该轮成功对话提交；生成或发送失败不会另建入站事件。
 
-`dialog.json` 保存已校验的 `story_updates` 作为权威提交，两个新JSON是可恢复投影。只有sent记录应用；每个文件原子更新已应用对话ID和条目。发送成功后若一份投影写入失败，暂停写信、继续尝试本地恢复，下轮或重启仅补齐投影，**不重新发信**。非空损坏或内容与权威记录不符时拒绝覆盖，请先停机备份、排查，不手动清空或随意修改这些文件。详见 [memory/README.md](memory/README.md)。
+运行时使用 `schema_version: 2`：`dialog.json` 只保存梗概和邮件元数据，没有 `story_updates`；`event.json` 和 `memory.json` 各自按 `dialog_id` 保存更新批次及历史版本。启用提取时，两边即使无更新也各保留一个空批次。长期记忆落盘为 `source: "dialogue"`，原证据来源保存在 `evidence_source`，证据引用不变。首次从 v1 切换，先在完整静态副本上用 `python src/migrate_dialog_memory.py --source-dir <旧目录> --output-dir <新目录>` 导出；不要把 v1 与 v2 混用，也不要只还原一份 JSON。迁移脚本不修改任务库。
 
 ### 发送结果不确定时
 
-程序在发信前保存摘要，SMTP 接受后才确认 `sent`。发生异常时，可能留下 `prepared`、`sending` 或 `unknown`，这类记录会阻止后续自动发送，需要先核实，不能简单重跑。
+程序先在 SQLite 持久化发送计划，再保存对话摘要并开始 SMTP。未开始 SMTP 的计划可安全恢复；SMTP 返回并被持久确认后，即使只写好一份故事文件，重启也只补齐本地批次，不会重发。若在 SMTP 调用开始至确认写入之间中断，就无法仅凭本地文件判断是否发出，程序暂停发信等待核验。
 
-**不要清空 `dialog.json` 试图修复故障，也不要在脚本运行时手工编辑。** 空白文件会被视为空记忆，会丢掉历史和待核验信息。详细核验和恢复步骤见 [memory/README.md](memory/README.md)。
+**不要清空或在运行中手工编辑记忆文件。** 缺失、空白、混用版本或无法匹配已确认计划的文件都会阻止发送；请停机保留现状，再核对同一时点的备份。两份批次历史若同时被替换成相同的旧前缀，已完成任务的原批次不会从对话梗概重建。
 
 ## 7. 日志与故障排查
 

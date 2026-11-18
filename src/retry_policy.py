@@ -35,8 +35,6 @@ def classify_error(exc, service="api"):
     if isinstance(exc, OSError):
         return "transient", service + "_connection_failed"
     if isinstance(exc, ValueError):
-        if type(exc).__name__ == "ResponseProtocolError":
-            return "invalid", "api_response_protocol_invalid"
         return "invalid", "model_output_invalid"
     return "fatal", service + "_unexpected_failure"
 

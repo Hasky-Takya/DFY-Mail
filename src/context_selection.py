@@ -9,7 +9,7 @@ import copy
 from datetime import datetime, timezone
 
 
-RECENT_LIMIT = 20
+RECENT_LIMIT = 35
 DIALOG_FIELDS = (
     "id", "type", "received_at", "received_at_source", "sent_at", "user_summary",
     "assistant_summary", "user_message_id", "assistant_message_id",
@@ -36,42 +36,13 @@ def dialog_view(record):
     return entry
 
 
-def compact_story(context, graph=None):
-    simplified = {}
-    for item in (graph or {}).get("facts", []):
-        ref = item.get("ref")
-        source = item.get("source_ref", {})
-        if ref or source.get("id"):
-            simplified[ref or source["id"]] = item
+def compact_story(context):
     result = {"revision": context["revision"], "view": "compact", "events": [], "memories": []}
     for kind in ("events", "memories"):
         for item in context[kind]:
             view = {key: copy.deepcopy(value) for key, value in item.items() if key != "source_refs"}
             view["source_refs"] = copy.deepcopy(item["source_refs"][-1:])
-            short = simplified.get(item["id"])
-            if short and short.get("source_ref", {}).get("version") == item["version"]:
-                view["content"] = short["text"]
             result[kind].append(view)
-    return result
-
-
-def visible_story_ids(payload):
-    """Actual source IDs shown in either canonical display or graph fact views."""
-    result = {"events": set(), "memories": set()}
-    story = payload.get("story_context") or {}
-    graph = payload.get("graph_context") or {}
-    for kind in result:
-        result[kind].update(item["id"] for item in story.get(kind, []))
-        result[kind].update(item["id"] for item in graph.get(kind, []))
-    for kind in ("profiles", "preferences"):
-        result["memories"].update(item.get("source_ref", {}).get("id", item["id"])
-                                  for item in graph.get(kind, []))
-    for item in graph.get("facts", []):
-        ref = item.get("source_ref", {})
-        kind = "events" if ref.get("kind") == "event" or item.get("category") == "event" else "memories"
-        source_id = ref.get("id") or item.get("ref")
-        if source_id:
-            result[kind].add(source_id)
     return result
 
 
@@ -89,11 +60,6 @@ def select_context(payload, *, limit, render, system_chars=0, recent_limit=RECEN
     story = selected.get("story_context")
     if story is not None:
         groups.update(events=story["events"], memories=story["memories"])
-    graph = selected.get("graph_context")
-    if graph is not None:
-        for kind in ("facts", "events", "memories", "profiles", "preferences", "entities", "relations", "states", "event_relations"):
-            if isinstance(graph.get(kind), list):
-                groups["graph_" + kind] = graph[kind]
     state = selected.get("conversation_state")
     if state is not None:
         for key in ("known_reply_relations", "observed_user_activity"):
@@ -113,32 +79,10 @@ def select_context(payload, *, limit, render, system_chars=0, recent_limit=RECEN
     while True:
         # Links are useful only when the actual event item was displayed. Keep
         # canonical related_event_ids untouched outside this request-only copy.
-        source_ids = visible_story_ids(selected)
         if story is not None:
-            event_ids = source_ids["events"]
+            event_ids = {item["id"] for item in story["events"]}
             for item in story["memories"]:
                 item["related_event_ids"] = [value for value in item.get("related_event_ids", []) if value in event_ids]
-        if graph is not None:
-            entities = {item["id"] for item in graph.get("entities", [])}
-            events = source_ids["events"]
-            sources = events | source_ids["memories"]
-            for kind in ("relations", "states", "event_relations"):
-                items = graph.get(kind, [])
-                def closed(item):
-                    if kind == "event_relations":
-                        endpoints = item.get("subject") in events and item.get("object") in events
-                    elif kind == "states":
-                        endpoints = item.get("subject") in entities
-                    else:
-                        objects = entities | events if item.get("predicate") in ("participates_in", "organizes") else entities
-                        endpoints = item.get("subject") in entities and item.get("object") in objects
-                    return endpoints and (not item.get("support_ref") or item["support_ref"] in sources)
-                kept = [item for item in items if closed(item)]
-                if len(kept) != len(items):
-                    items[:] = kept
-                    name = "graph_" + kind
-                    metadata[name]["selected"] = len(items)
-                    metadata[name]["omitted"] = metadata[name]["total"] - len(items)
         text = render(selected)
         if len(text) + system_chars <= limit:
             return selected, text

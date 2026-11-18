@@ -5,22 +5,21 @@ import json
 import logging
 import os
 import smtplib
+import time
 from getpass import getpass
 from pathlib import Path
 
 from openai import OpenAIError
 
 from dfy_test import DeepSeekChat
-from dialog_memory import (
+from dialogueManager.dialog_memory import (
     DialogMemory, MEMORY_PATH, MemoryError, SummaryError, load_story_extraction_prompt, load_summary_prompt,
-    new_record, recent_proactive_subjects, render_email_prompt, send_recorded, summarize,
+    new_record, recent_proactive_subjects, recover_recorded, render_email_prompt, send_recorded, summarize,
 )
 from mail import MailClient, _load_settings
-from mail_logging import close_logging, set_log_secrets, start_logging, apply_logging_settings
-from runtime_config import require_credential
+from mail_logging import close_logging, set_log_secrets, start_logging
 from retry_policy import classify_chain, retry_delay
-from task_store import TaskStore, SingleInstanceLock
-import time
+from task_store import SingleInstanceLock, TaskStoreError, open_task_store
 
 
 logger = logging.getLogger("dfy.proactive")
@@ -35,8 +34,8 @@ def load_prompt(prompt_path: str | Path = PROMPT_PATH) -> dict:
         prompt = json.load(file)
     if not isinstance(prompt, dict):
         raise ValueError("prompt.json 必须是 JSON 对象。")
-    if not isinstance(prompt.get("subject"), str) or not prompt["subject"].strip():
-        raise ValueError("请在 prompt.json 中填写非空字符串：subject")
+    if not isinstance(prompt.get("subject"), str):
+        raise ValueError("prompt.json 中旧版 subject 必须是字符串，可留空以动态生成。")
     try:
         prompt["prompt"] = render_email_prompt(prompt, "send_task")
     except ValueError as exc:
@@ -53,7 +52,6 @@ def send_deepseek_email(
     config_path: str | Path | None = None,
     memory_path: str | Path = MEMORY_PATH,
     resume_task: str | None = None,
-    *, graph_settings=None,
 ) -> str:
     """生成并发送一次，返回 Message-ID；失败不自动重试。"""
     prompt = load_prompt(prompt_path)
@@ -62,25 +60,36 @@ def send_deepseek_email(
     logger.info("写信配置加载完成。")
     mailbox = MailClient(config_path=config_path, auth_code=auth_code)
     set_log_secrets(mailbox._auth_code)
-    bot = DeepSeekChat(api_key=api_key)
     secrets = (api_key or os.getenv("DEEPSEEK_API_KEY", ""), mailbox._auth_code)
-    if graph_settings is None:
-        configured = getattr(mailbox, "graph_settings", None)
-        graph_settings = configured if isinstance(configured, dict) else None
-    memory = DialogMemory(memory_path, secrets=secrets, graph_settings=graph_settings)
-    snapshot = memory.snapshot(include_story=extraction_prompt is not None)
+    memory = DialogMemory(memory_path, secrets=secrets)
+    account = "default-mailbox"
+    try:
+        store = open_task_store(Path(memory_path).parent)
+    except TaskStoreError as exc:
+        raise MemoryError(str(exc)) from None
+    snapshot = recover_recorded(memory, store, account=account, include_story=extraction_prompt is not None)
+    row = None
+    if resume_task is not None:
+        row = store.get(resume_task)
+        if not row or row["kind"] != "manual" or row["account"] != account:
+            raise MemoryError("只能恢复当前邮箱的手动任务。")
+        if row["status"] == "done" and row["dialog_id"]:
+            for dialog in snapshot["dialogs"]:
+                if dialog["id"] == row["dialog_id"] and dialog["status"] == "sent":
+                    logger.info("手动任务的原发送已确认，本次未调用 SMTP。")
+                    return dialog["assistant_message_id"]
+        if row["status"] not in ("pending", "retry") or row["dialog_id"] is not None:
+            raise MemoryError("只能恢复已释放的manual任务，不能恢复不确定发送。")
+    bot = DeepSeekChat(api_key=api_key)
     question = memory.question(
         snapshot, prompt["prompt"], mode="manual_proactive",
         observation={"sync_ok": None, "history_may_be_incomplete": True},
         story_context=snapshot.get("story_context"),
     )
-    store = TaskStore(Path(memory_path).parent / "tasks.sqlite3")
-    if resume_task is not None:
-        row = store.get(resume_task)
-        if not row or row["kind"] != "manual" or row["status"] not in ("pending", "retry"):
-            raise MemoryError("只能恢复已释放的manual任务，不能恢复不确定发送。")
+    if row is None:
+        row = store.create(account, {"snapshot": snapshot, "question": question}, kind="manual")
     else:
-        row = store.create("default-mailbox", {"snapshot": snapshot, "question": question}, kind="manual")
+        row["payload"].update(snapshot=snapshot, question=question)
     def request_with_backoff(action):
         failures = 0
         while True:
@@ -117,8 +126,6 @@ def send_deepseek_email(
                          for item in snapshot["dialogs"]],
                 validation_feedback=validation_feedback,
                 generate_subject=True, recent_subjects=recent_proactive_subjects(snapshot),
-                graph_context=snapshot.get("graph_context"),
-                graph_canonical=snapshot.get("graph_canonical"), graph_settings=memory.graph_settings,
             ))
             break
         except SummaryError as exc:
@@ -131,14 +138,8 @@ def send_deepseek_email(
                 raise MemoryError("手动任务已隔离，可修复后从任务工具恢复，未发送。") from None
     subject = summaries["mail_subject"]
     record = new_record(snapshot, None, summaries, subject=subject)
-    store.save(row["id"], row["payload"], status="sending", dialog_id=record["id"])
-    try:
-        result = send_recorded(memory, snapshot, record, mailbox, subject, body)
-    except MemoryError:
-        store.save(row["id"], row["payload"], status="blocked_unknown", dialog_id=record["id"], error_code="send_or_projection_unconfirmed")
-        raise
-    store.finish(row["id"])
-    return result
+    return send_recorded(memory, snapshot, record, mailbox, subject, body,
+                         store=store, task_id=row["id"], task_payload=row["payload"])
 
 
 def main() -> None:
@@ -155,19 +156,22 @@ def main() -> None:
         load_summary_prompt()
         load_story_extraction_prompt()
         settings = _load_settings()
-        apply_logging_settings(settings.get("logging"))
         set_log_secrets(os.getenv(settings["assistant"]["auth_code_env"], ""))
-        api_key = require_credential("DEEPSEEK_API_KEY", "请输入 DeepSeek API Key（不显示）：", input_func=getpass)
+        api_key = os.getenv("DEEPSEEK_API_KEY") or getpass("请输入 DeepSeek API Key（不显示）：")
         set_log_secrets(api_key)
-        auth_code = require_credential(settings["assistant"]["auth_code_env"],
-                                       "请输入助手邮箱客户端授权码（不显示）：", input_func=getpass)
+        auth_code = os.getenv(settings["assistant"]["auth_code_env"]) or getpass(
+            "请输入助手邮箱客户端授权码（不显示）："
+        )
         set_log_secrets(auth_code)
-        logger.info("正在生成邮件并发送给配置用户。")
+        logger.info("正在恢复手动任务。" if args.resume_task else "正在生成邮件并发送给配置用户。")
         options = {"resume_task": args.resume_task} if args.resume_task else {}
         send_deepseek_email(api_key=api_key, auth_code=auth_code, **options)
-        logger.info("SMTP 已接受邮件，不保证最终投递。")
-    except (MemoryError, ValueError) as exc:
-        logger.error("配置、输入或记忆状态无效，type=%s；若已进入发送步骤请先核验，勿盲目重跑。",
+        logger.info("手动任务已完成；SMTP 已接受该邮件，不保证最终投递。")
+    except MemoryError as exc:
+        logger.error("手动任务停止；%s 若已进入发送步骤请先核验，勿盲目重跑。", exc)
+        raise SystemExit(1) from None
+    except ValueError as exc:
+        logger.error("配置或输入无效，type=%s；若已进入发送步骤请先核验，勿盲目重跑。",
                      type(exc).__name__, exc_info=True)
         raise SystemExit(1) from None
     except OpenAIError as exc:

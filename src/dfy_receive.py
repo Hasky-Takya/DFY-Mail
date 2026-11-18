@@ -13,19 +13,18 @@ from datetime import datetime, timezone
 from getpass import getpass
 from pathlib import Path
 
-from openai import APIConnectionError, APIStatusError, OpenAIError
+from openai import OpenAIError
 
 from dfy_test import DeepSeekChat
-from dialog_memory import (
+from dialogueManager.dialog_memory import (
     DialogMemory, MEMORY_PATH, MemoryError, SummaryError, ContextBudgetError, load_story_extraction_prompt, load_summary_prompt, new_record,
-    now_iso, redact, render_email_prompt, resolve_reply, send_recorded, summarize, snapshot_basis,
+    now_iso, recover_recorded, redact, render_email_prompt, resolve_reply, send_recorded, snapshot_matches, summarize,
 )
 from mail import MailboxStateError, MailClient, _load_settings
-from mail_logging import close_logging, set_log_secrets, start_logging, apply_logging_settings
-from runtime_config import require_credential
+from mail_logging import close_logging, set_log_secrets, start_logging
 from vision import normalize_user_content, observe_images
 from retry_policy import classify_chain, classify_error, retry_delay
-from task_store import TaskStore, UidValidityChanged, SingleInstanceLock
+from task_store import SingleInstanceLock, TaskStoreError, open_task_store
 
 
 logger = logging.getLogger("dfy.receive")
@@ -72,17 +71,14 @@ class MailReceiver:
         self, mailbox: MailClient, bot: DeepSeekChat, reply_prompt: str, *,
         memory_path: str | Path = MEMORY_PATH, summary_prompt: str | None = None, secrets=(),
         on_user_message=None, extraction_prompt: str | None = None,
-        task_store=None, clock=None, graph_settings=None,
+        task_store=None, clock=None,
     ):
         self.on_user_message = on_user_message
         self.clock = clock or time.time
-        queue_path = Path(memory_path).parent / "tasks.sqlite3"
-        queue_marker = queue_path.with_suffix(".initialized")
-        if task_store is None and queue_marker.exists() and not queue_path.exists():
-            raise MemoryError("持久任务库缺失，code=queue_missing；请恢复备份，禁止重新建立基线。")
-        self.store = task_store or TaskStore(queue_path)
-        if task_store is None and not queue_marker.exists():
-            queue_marker.write_text("durable-queue-v1\n", encoding="ascii")
+        try:
+            self.store = task_store if task_store is not None else open_task_store(Path(memory_path).parent)
+        except TaskStoreError as exc:
+            raise MemoryError(str(exc)) from None
         self.account = "default-mailbox"  # 数据库按记忆目录隔离，迁移路径不改变账户游标。
         self.paused = None
         self.sync_failures = 0
@@ -92,7 +88,7 @@ class MailReceiver:
         self.mailbox = mailbox
         self.bot = bot
         self.reply_prompt = reply_prompt
-        self.memory = DialogMemory(memory_path, secrets=secrets, graph_settings=graph_settings)
+        self.memory = DialogMemory(memory_path, secrets=secrets)
         self.summary_prompt = summary_prompt if summary_prompt is not None else load_summary_prompt()
         self.stopped = False
         self.cursor = None
@@ -165,31 +161,30 @@ class MailReceiver:
             task["next_attempt_at"] = row["next_attempt_at"]
             self.pending.append(task)
 
-    def _save_task(self, task, status="pending", *, code=None, when=0, dialog_id=None):
-        self.store.save(task["task_id"], task, status=status, next_attempt_at=when,
-                        error_code=code, dialog_id=dialog_id)
+    def _save_task(self, task, status="pending", *, code=None, when=0):
+        self.store.save(task["task_id"], task, status=status, next_attempt_at=when, error_code=code)
 
     def recover_memory(self):
         try:
-            bound = self.store.list_tasks(statuses=("sending", "unknown", "blocked_unknown", "done"), kind=None, account=self.account)
-            if any(row["dialog_id"] for row in bound):
-                if not self.memory.path.exists() or not self.memory.path.read_text(encoding="utf-8-sig").strip():
-                    raise MemoryError("存在发送计划但对话日志缺失，禁止将其当空历史恢复。")
-            snapshot = self.memory.snapshot(include_story=self.extraction_prompt is not None)
-            self.store.reconcile(snapshot["dialogs"])
-            self.blocked_reason = None
-            self.stopped = False
-            return snapshot
-        except MemoryError:
+            snapshot = recover_recorded(
+                self.memory, self.store, account=self.account,
+                include_story=self.extraction_prompt is not None,
+            )
+        except MemoryError as exc:
             self.blocked_reason = "memory_recovery_required"
-            logger.error("记忆暂不可提交，code=memory_recovery_required；继续接收持久化，不自动重发。")
+            logger.error("记忆暂不可提交，code=memory_recovery_required；%s 继续接收持久化，不自动重发。", exc)
             return None
+        self.blocked_reason = None
+        self.stopped = False
+        return snapshot
 
     def start(self) -> None:
         if self.cursor is not None:
             raise RuntimeError("该监听实例已经启动。")
-        self.recover_memory()
+        snapshot = self.recover_memory()
         saved = self.store.cursor(self.account)
+        if snapshot is None and saved is None:
+            raise MemoryError("记忆恢复受阻且无已保存的收信游标；未建立新基线，请先核验本地数据。")
         logger.info("正在恢复收信游标；首次运行才建立基线。")
         self.paused = self.store.get_control("service:imap:paused")
         if self.paused and saved is not None:
@@ -317,10 +312,9 @@ class MailReceiver:
             if self.store.get_control("service:api:paused"):
                 return imap_ok
             current_snapshot = self.memory.snapshot(include_story=self.extraction_prompt is not None)
-            if "snapshot" in task and snapshot_basis(task["snapshot"]) != snapshot_basis(current_snapshot):
-                for key in ("snapshot", "body", "summaries", "validation_feedback"):
+            if not snapshot_matches(task.get("snapshot"), current_snapshot):
+                for key in ("body", "summaries", "validation_feedback"):
                     task.pop(key, None)
-            if "snapshot" not in task:
                 task["snapshot"] = current_snapshot
             logger.info(
                 "正在为 UID=%s 调用 DeepSeek，attempt=%s body_chars=%s",
@@ -364,9 +358,6 @@ class MailReceiver:
                         anchors={"as_of": now_iso(), "received_at": message["received_at"],
                                  "received_at_source": message["received_at_source"]},
                         validation_feedback=task.get("validation_feedback"),
-                        graph_context=task["snapshot"].get("graph_context"),
-                        graph_canonical=task["snapshot"].get("graph_canonical"),
-                        graph_settings=self.memory.graph_settings,
                     )
                 body = task["body"]
             except (OpenAIError, ValueError) as exc:
@@ -414,38 +405,34 @@ class MailReceiver:
                 self.pending.rotate(-1)
                 continue
             logger.info("开始保存梗概并发送回复，原信 UID=%s", message["uid"])
-            # 从此处起任何中断都不得重新进入 SMTP；磁盘上保留可核验状态。
-            self.stopped = True
-            record = None
             try:
                 record = new_record(task["snapshot"], message, task["summaries"],
                                     image_observations=task.get("image_observations"))
-                self._save_task(task, "sending", dialog_id=record["id"])
+            except (MemoryError, ValueError):
+                self.store.quarantine(task["task_id"], task, error_code="record_validation_failed")
+                logger.error("任务已隔离，UID=%s code=record_validation_failed；未发送。", message["uid"])
+                self.pending.popleft()
+                continue
+            # 由共享发送流程持久化各阶段；异常后须先恢复，不能直接重入 SMTP。
+            self.stopped = True
+            try:
                 send_recorded(
                     self.memory, task["snapshot"], record, self.mailbox,
                     reply_subject(message["subject"]), body,
+                    store=self.store, task_id=task["task_id"], task_payload=task,
                     in_reply_to=message["message_id"], references=message.get("references", ""),
                     auto_replied=True,
                 )
             except (MemoryError, smtplib.SMTPException, OSError, ValueError) as exc:
-                logger.error(
-                    "发信步骤异常，UID=%s type=%s smtp_code=%s；结果可能不确定，停止监听。",
-                    message["uid"], type(exc).__name__, getattr(exc, "smtp_code", None), exc_info=True,
-                )
-                if record is None:
-                    self.store.quarantine(task["task_id"], task, error_code="record_validation_failed")
-                    self.pending.popleft()
-                    self.stopped = False
-                    continue
-                severity, code = classify_chain(exc, "smtp")
+                _, code = classify_chain(exc, "smtp")
                 if code in ("smtp_auth_failed", "tls_verification_failed"):
                     self.store.set_control("service:smtp:paused", code)
                     logger.critical("SMTP服务暂停，code=%s；原发送任务待核验。", code)
-                self._save_task(task, "blocked_unknown", code="send_or_projection_unconfirmed", dialog_id=record["id"])
                 self.blocked_reason = "send_or_projection_unconfirmed"
-                logger.critical("发送已暂停，code=send_or_projection_unconfirmed；继续收信，不自动重发。")
+                detail = str(exc) if isinstance(exc, MemoryError) else type(exc).__name__
+                logger.error("发送已暂停，UID=%s code=send_or_projection_unconfirmed；%s 继续收信，先恢复记录。",
+                             message["uid"], detail)
                 return False
-            self.store.finish(task["task_id"])
             self.pending.popleft()
             self.prune_observed_activity()
             self.stopped = False
@@ -479,7 +466,7 @@ class MailReceiver:
                 self.poll_once()
             except MemoryError as exc:
                 self.blocked_reason = "memory_recovery_required"
-                logger.critical("写信暂停，code=memory_recovery_required type=%s。", type(exc).__name__)
+                logger.critical("写信暂停，code=memory_recovery_required；%s", exc)
             now = time.monotonic()
             waits = [seconds]
             wall = self.clock()
@@ -498,24 +485,27 @@ def main() -> None:
         instance_lock.acquire()
         logger.info("监听进程启动，日志文件：%s", log_path)
         settings = _load_settings()
-        apply_logging_settings(settings.get("logging"))
         set_log_secrets(os.getenv(settings["assistant"]["auth_code_env"], ""))
         logger.info("邮箱配置加载完成。")
         seconds = interval_seconds(settings)
         prompt = load_reply_prompt()
         summary_prompt = load_summary_prompt()
         extraction_prompt = load_story_extraction_prompt()
-        api_key = require_credential("DEEPSEEK_API_KEY", "请输入 DeepSeek API Key（不显示）：", input_func=getpass)
+        api_key = os.getenv("DEEPSEEK_API_KEY") or getpass("请输入 DeepSeek API Key（不显示）：")
         set_log_secrets(api_key)
-        auth_code = require_credential(settings["assistant"]["auth_code_env"],
-                                       "请输入助手邮箱客户端授权码（不显示）：", input_func=getpass)
+        auth_code = os.getenv(settings["assistant"]["auth_code_env"]) or getpass(
+            "请输入助手邮箱客户端授权码（不显示）："
+        )
         set_log_secrets(api_key, auth_code)
         mailbox = MailClient(auth_code=auth_code)
         bot = DeepSeekChat(api_key=api_key)
         MailReceiver(mailbox, bot, prompt, summary_prompt=summary_prompt, secrets=(api_key, auth_code),
-                     extraction_prompt=extraction_prompt, graph_settings=settings.get("graph")).run(seconds)
+                     extraction_prompt=extraction_prompt).run(seconds)
     except (KeyboardInterrupt, EOFError):
         logger.info("用户中断，监听已停止。若正在发信，请核验收件箱；未处理任务已保存在本地队列。")
+    except MemoryError as exc:
+        logger.error("监听停止；%s", exc)
+        raise SystemExit(1) from None
     except (MailboxStateError, RuntimeError, ValueError) as exc:
         logger.error("配置或运行状态无效，type=%s，监听停止；若已发信请先核验收件箱，勿盲目重试。",
                      type(exc).__name__, exc_info=True)
